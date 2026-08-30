@@ -39,21 +39,21 @@ export interface DistillationConfig {
 
 export const DEFAULT_DISTILLATION_CONFIG: DistillationConfig = {
   l1: {
-    messageThreshold: 5,
-    idleSeconds: 60,
+    messageThreshold: 3,        // 降低到 3 条消息即触发
+    idleSeconds: 30,            // 降低到 30 秒
     batchSize: 10,
     enableDedup: true,
     maxMemoriesPerSession: 50,
   },
   l2: {
-    minIntervalMs: 15 * 60 * 1000,
+    minIntervalMs: 5 * 60 * 1000,    // 降低到 5 分钟
     maxIntervalMs: 60 * 60 * 1000,
-    topicThreshold: 3,
-    delayAfterL1Seconds: 90,
+    topicThreshold: 2,                // 降低到 2 条同场景即触发
+    delayAfterL1Seconds: 30,           // L1 完成后 30 秒即触发 L2
   },
   l3: {
     conditions: ["explicit_request", "cold_start", "restore", "first_scene", "threshold"],
-    importanceThreshold: 0.6,
+    importanceThreshold: 0.4,          // 降低重要性阈值
   },
 };
 
@@ -140,6 +140,7 @@ export class DistillationPipeline {
   private vectorStore: VectorStore;
   private llmRunner?: (systemPrompt: string, userPrompt: string) => Promise<string>;
   private subagentRunner?: (message: string) => Promise<string>;
+  private logger?: { info?: (msg: string) => void; debug?: (msg: string) => void; warn?: (msg: string) => void };
 
   private lastL1At: number | null = null;
   private lastL2At: number | null = null;
@@ -160,6 +161,10 @@ export class DistillationPipeline {
     this.store = store || new MemoryStore();
     this.vectorStore = vectorStore || new VectorStore();
     this.llmRunner = llmRunner;
+  }
+
+  setLogger(logger: { info?: (msg: string) => void; debug?: (msg: string) => void; warn?: (msg: string) => void }): void {
+    this.logger = logger;
   }
 
   /**
@@ -342,16 +347,27 @@ export class DistillationPipeline {
     const errors: string[] = [];
     let produced = 0;
 
+    this.logger?.info?.(`[memory_new] L2: starting distillation...`);
+
     try {
       // Check time constraints
       const now = Date.now();
       if (this.lastL2At && now - this.lastL2At < this.config.l2.minIntervalMs) {
+        // 即使时间未到，也尝试合并已有场景
+        const existingScenes = await this.store.getSceneIndex();
+        if (existingScenes.length > 0) {
+          this.logger?.debug?.(`[memory_new] L2: skipping time check, existing scenes: ${existingScenes.length}`);
+        }
+        this.logger?.debug?.(`[memory_new] L2: too soon since last run, skipping`);
         return { stage: "L2", produced: 0, errors: ["Too soon since last L2"] };
       }
 
       // Search all L1 records
+      this.logger?.debug?.(`[memory_new] L2: searching L1 records...`);
       const l1Records = await this.store.searchL1("", 100);
-      if (l1Records.length < this.config.l2.topicThreshold) {
+      this.logger?.info?.(`[memory_new] L2: found ${l1Records.length} L1 records`);
+      if (l1Records.length < 2) {
+        this.logger?.debug?.(`[memory_new] L2: not enough L1 records (${l1Records.length})`);
         return { stage: "L2", produced: 0, errors: ["Not enough L1 records"] };
       }
 
@@ -364,9 +380,11 @@ export class DistillationPipeline {
         sceneGroups.get(record.sceneName)!.push(record);
       }
 
-      // Create scene blocks
+      this.logger?.debug?.(`[memory_new] L2: found ${sceneGroups.size} scenes, processing...`);
+
+      // Create scene blocks - 只要同场景有 >= 2 条就创建
       for (const [sceneName, records] of sceneGroups) {
-        if (records.length < this.config.l2.topicThreshold) continue;
+        if (records.length < 2) continue;  // 同场景至少 2 条
 
         const avgPriority = records.reduce((sum, r) => sum + r.priority, 0) / records.length;
         const content = this.buildSceneContent(sceneName, records);
@@ -374,7 +392,7 @@ export class DistillationPipeline {
         await this.store.storeL2({
           title: sceneName,
           content,
-          summary: `平均优先级: ${avgPriority.toFixed(0)}`,
+          summary: `平均优先级: ${avgPriority.toFixed(0)}, ${records.length} 条记忆`,
           tags: [sceneName],
           metadata: {
             layer: "L2" as const,
@@ -383,15 +401,19 @@ export class DistillationPipeline {
           },
         });
         produced++;
+        this.logger?.info?.(`[memory_new] L2: created scene "${sceneName}" with ${records.length} records`);
       }
 
       this.lastL2At = now;
 
       // Schedule L3 after L2
-      setTimeout(() => this.distill("L3"), 5000);
+      if (produced > 0) {
+        setTimeout(() => this.distill("L3"), 5000);
+      }
 
     } catch (e) {
       errors.push(String(e));
+      this.logger?.debug?.(`[memory_new] L2 error: ${e}`);
     }
 
     return { stage: "L2", produced, errors };

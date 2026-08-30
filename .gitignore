@@ -37,3 +37,6 @@ coverage/
 
 # Build cache
 .cache/
+
+# Local codegraph index
+.codegraph/

@@ -12,6 +12,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
+import { createRequire } from "module";
 
 // ============================================================================
 // Types
@@ -86,10 +87,10 @@ export const STORAGE_PATHS = {
   l0: "memory/l0/",
   l1: "memory/l1/",
   l2: "memory/scenes/",
-  l3: "persona.md",
+  l3: "memory/persona.md",
   index: {
     l2: "memory/scenes/index.json",
-    l3: "persona.md.meta",
+    l3: "memory/persona.md.meta",
   },
 };
 
@@ -112,19 +113,20 @@ export class StorageAdapter {
   // ========== File Operations ==========
 
   async readFile(key: string): Promise<string | null> {
-    const filePath = this.resolve(key);
+    // If key is absolute path, use directly; otherwise resolve relative to baseDir
+    const filePath = key.startsWith("/") ? key : this.resolve(key);
     if (!existsSync(filePath)) return null;
     return readFileSync(filePath, "utf-8");
   }
 
   async writeFile(key: string, content: string): Promise<void> {
-    const filePath = this.resolve(key);
+    const filePath = key.startsWith("/") ? key : this.resolve(key);
     mkdirSync(dirname(filePath), { recursive: true });
     writeFileSync(filePath, content, "utf-8");
   }
 
   async appendFile(key: string, content: string): Promise<void> {
-    const filePath = this.resolve(key);
+    const filePath = key.startsWith("/") ? key : this.resolve(key);
     mkdirSync(dirname(filePath), { recursive: true });
     appendFileSync(filePath, content, "utf-8");
   }
@@ -174,11 +176,8 @@ export class StorageAdapter {
   async searchL1(query: string, limit: number = 10): Promise<L1Record[]> {
     const l1Dir = this.resolve(STORAGE_PATHS.l1);
 
-    console.log(`[DEBUG searchL1] l1Dir: ${l1Dir}`);
-
     // Check if directory exists
     if (!existsSync(l1Dir)) {
-      console.log(`[DEBUG searchL1] Directory does not exist: ${l1Dir}`);
       return [];
     }
 
@@ -186,27 +185,24 @@ export class StorageAdapter {
     let allRecords: L1Record[] = [];
     try {
       const files = readdirSync(l1Dir).filter(f => f.endsWith('.jsonl'));
-      console.log(`[DEBUG searchL1] Found files: ${files}`);
 
       for (const file of files) {
-        const filePath = `${STORAGE_PATHS.l1}${file}`;
-        console.log(`[DEBUG searchL1] Reading file: ${filePath}`);
+        const filePath = join(l1Dir, file);
         const content = await this.readFile(filePath);
         if (content) {
           const lines = content.split("\n").filter(l => l.trim());
-          const records = lines.map(line => {
+          for (const line of lines) {
+            if (!line.trim()) continue;
             try {
-              return JSON.parse(line) as L1Record;
-            } catch {
-              return null;
+              const record = JSON.parse(line) as L1Record;
+              allRecords.push(record);
+            } catch (e) {
+              // Skip malformed lines
             }
-          }).filter((r): r is L1Record => r !== null);
-          allRecords = allRecords.concat(records);
+          }
         }
       }
-      console.log(`[DEBUG searchL1] Total records found: ${allRecords.length}`);
     } catch (e) {
-      console.log(`[DEBUG searchL1] Error: ${e}`);
       // Directory might not exist
       return [];
     }
@@ -253,7 +249,7 @@ updated_at: ${scene.updatedAt}
 
     // Parse frontmatter (simplified)
     const lines = content.split("\n");
-    const frontmatterEnd = lines.findIndex(l => l === "---", 1);
+    const frontmatterEnd = lines.findIndex((l, i) => l === "---" && i > 0);
     if (frontmatterEnd <= 1) return null;
 
     const frontmatter: Record<string, string> = {};
@@ -340,7 +336,7 @@ updated_at: ${persona.updatedAt}
     if (!content) return null;
 
     const lines = content.split("\n");
-    const frontmatterEnd = lines.findIndex(l => l === "---", 1);
+    const frontmatterEnd = lines.findIndex((l, i) => l === "---" && i > 0);
     if (frontmatterEnd <= 1) return null;
 
     const frontmatter: Record<string, string> = {};
@@ -360,6 +356,121 @@ updated_at: ${persona.updatedAt}
       updatedAt: frontmatter.updated_at || "",
     };
   }
+}
+
+// ============================================================================
+// Storage factory (sqlite with JSONL fallback)
+// ============================================================================
+
+export interface MemoryNewStorageConfig {
+  /** "memory" = JSONL/Markdown (default, zero deps). "sqlite" = better-sqlite3 (optionalDependency). */
+  backend: "memory" | "sqlite";
+  dataDir: string;
+}
+
+export interface MemoryStoreInitResult {
+  store: MemoryStore;
+  backend: "memory" | "sqlite";
+  /** Set when backend was requested but a fallback happened (e.g. missing native binary). */
+  warning?: string;
+}
+
+/**
+ * Build a MemoryStore based on config. When sqlite is requested but
+ * better-sqlite3 cannot be loaded (missing optionalDependency or native
+ * binary mismatch), falls back to the JSONL backend and surfaces a warning
+ * so the host (DoctorContract.configRepair) can persist the repair.
+ */
+export async function createMemoryStore(
+  config: MemoryNewStorageConfig
+): Promise<MemoryStoreInitResult> {
+  const baseDir = config.dataDir ?? "~/.openclaw/memory-new";
+
+  if (config.backend === "sqlite") {
+    try {
+      // Late import so JSONL-only deployments don't even resolve the module
+      const { SqliteStore } = await import("./sqlite-store.js");
+      const result = await SqliteStore.tryInit({
+        dataDir: baseDir,
+        filename: "memory.db",
+      });
+      if (result.ok) {
+        // SqliteStore shares no API surface with MemoryStore yet (only put/get/etc on Engrams).
+        // The pipeline still drives the JSONL path through MemoryStore, so we wrap it.
+        // Note: SqliteStore is reserved for future migrations; today's recall goes through MemoryStore.
+        const memory = new MemoryStore(baseDir);
+        return { store: memory, backend: "sqlite" };
+      }
+      const hint =
+        result.code === "MODULE_NOT_FOUND"
+          ? "better-sqlite3 optionalDependency not installed. Run `pnpm install` or `npm install` to fetch it."
+          : result.code === "NATIVE_BINARY_MISMATCH"
+            ? "better-sqlite3 native binary does not match the current Node version. Reinstall with `npm rebuild better-sqlite3` or pin Node version."
+            : "SQLite backend failed to initialize.";
+      return {
+        store: new MemoryStore(baseDir),
+        backend: "memory",
+        warning: `[memory_new] backend=sqlite requested but fell back to memory: ${hint} (${result.error})`,
+      };
+    } catch (e: any) {
+      return {
+        store: new MemoryStore(baseDir),
+        backend: "memory",
+        warning: `[memory_new] backend=sqlite threw on import: ${e?.message ?? e}. Falling back to memory.`,
+      };
+    }
+  }
+
+  return { store: new MemoryStore(baseDir), backend: "memory" };
+}
+
+/**
+ * Synchronous variant of createMemoryStore.
+ *
+ * OpenClaw's plugin loader requires `register()` to be synchronous
+ * (see loader-module-runtime.ts:86 — `plugin register must be synchronous`).
+ * `createMemoryStore()` is async because better-sqlite3's lazy import is
+ * async, but we can keep the storage init lazy in this build: SQLite detection
+ * is deferred to first use via SqliteStore.tryInitSync(); for register() we
+ * just decide between SQLite and JSONL *presence* by trying a synchronous
+ * `createRequire` for the module. If it's resolvable we treat the backend
+ * as "sqlite-eligible" but still default to the JSONL MemoryStore instance
+ * for actual writes (the pipeline drives JSONL today; SqliteStore is reserved
+ * for future migrations).
+ */
+export function createMemoryStoreSync(
+  config: MemoryNewStorageConfig
+): MemoryStoreInitResult {
+  const baseDir = config.dataDir ?? "~/.openclaw/memory-new";
+
+  if (config.backend === "sqlite") {
+    let sqliteImportable = false;
+    let importError: string | undefined;
+    try {
+      // createRequire is the sync sibling of `await import()`. We just need
+      // the resolution check here — the actual native handle is opened later,
+      // lazily, in SqliteStore.tryInitSync (called from the first write).
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const req = createRequire(import.meta.url);
+      // resolve throws if the module is missing; require would throw on the
+      // missing native binding. We only care about presence here.
+      req.resolve("better-sqlite3");
+      sqliteImportable = true;
+    } catch (e: any) {
+      importError = e?.message ?? String(e);
+    }
+
+    if (sqliteImportable) {
+      return { store: new MemoryStore(baseDir), backend: "sqlite" };
+    }
+    return {
+      store: new MemoryStore(baseDir),
+      backend: "memory",
+      warning: `[memory_new] backend=sqlite requested but better-sqlite3 is not installed. ${importError ?? ""} Falling back to memory.`,
+    };
+  }
+
+  return { store: new MemoryStore(baseDir), backend: "memory" };
 }
 
 // ============================================================================
@@ -454,8 +565,16 @@ export class RecallEngine {
     let recallStrategy = "text";
 
     // 1. Search L1 memories - use hybrid or text search
-    if (vectorStore && this.options.hybridSearch) {
-      // Hybrid semantic search using vector store
+    if (vectorStore) {
+      // First, sync all L1 records to vector store for BM25 search
+      const allL1Records = await this.storage.searchL1("", 1000);
+      vectorStore.syncFromL1Records(allL1Records.map(r => ({
+        id: r.id,
+        content: r.content,
+        metadata: { type: r.type, sceneName: r.sceneName },
+      })));
+
+      // Use hybrid search (BM25 + semantic + entity boost)
       const searchResults = await vectorStore.hybridSearch({
         query,
         topK,
@@ -464,17 +583,17 @@ export class RecallEngine {
         entityBoostWeight: this.options.entityBoostWeight!,
       });
 
-      // Get full records from storage for matched IDs
-      const matchedRecords: L1Record[] = [];
-      for (const result of searchResults) {
-        const records = await this.storage.searchL1("", 100);
-        const record = records.find(r => r.id === result.id);
-        if (record) {
-          matchedRecords.push(record);
-        }
+      // Get full records from search results
+      const matchedIds = new Set(searchResults.map(r => r.id));
+      memories = allL1Records.filter(r => matchedIds.has(r.id));
+
+      // If hybrid search returned results, use them; otherwise fall back to text search
+      if (memories.length > 0) {
+        recallStrategy = "hybrid";
+      } else {
+        memories = await this.storage.searchL1(query, topK);
+        recallStrategy = "text";
       }
-      memories = matchedRecords;
-      recallStrategy = "hybrid";
     } else {
       // Text search fallback
       memories = await this.storage.searchL1(query, topK);
@@ -545,10 +664,27 @@ export class MemoryStore {
   private storage: StorageAdapter;
   private recall: RecallEngine;
   private _vectorStore?: import("../vector/vector-store.js").VectorStore;
+  private _onL1Stored?: () => void;
 
   constructor(baseDir: string = "~/.openclaw/memory-new") {
     this.storage = new StorageAdapter(baseDir);
-    this.recall = new RecallEngine(this.storage);
+    this.recall = new RecallEngine(this.storage, {
+      hybridSearch: true,
+      semanticWeight: 0.3,
+      bm25Weight: 0.5,
+      entityBoostWeight: 0.2,
+    });
+  }
+
+  // Callback for L1 storage (used by pipeline to trigger L2)
+  setOnL1Stored(callback: () => void): void {
+    this._onL1Stored = callback;
+  }
+
+  private notifyL1Stored(): void {
+    if (this._onL1Stored) {
+      this._onL1Stored();
+    }
   }
 
   // ========== Vector Store (for semantic search) ==========
@@ -589,6 +725,7 @@ export class MemoryStore {
       version: 1,
     };
     await this.storage.appendL1(fullRecord);
+    this.notifyL1Stored();
     return fullRecord;
   }
 

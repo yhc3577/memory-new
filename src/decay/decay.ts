@@ -263,12 +263,26 @@ export function applyDecayBatch(
 
     switch (freshness) {
       case "forgotten":
+        decayLogger.log({
+          engramId: engram.id,
+          from: engram.status,
+          to: "forgotten",
+          reason: "importance",
+          metadata: { freshness, importance: engram.importance },
+        });
         engram.status = "forgotten";
         result.forgotten.push(engram.id);
         break;
 
       case "stale":
         if (engram.importance < 0.2) {
+          decayLogger.log({
+            engramId: engram.id,
+            from: engram.status,
+            to: "frozen",
+            reason: "importance",
+            metadata: { freshness, importance: engram.importance },
+          });
           engram.status = "frozen";
           result.frozen.push(engram.id);
         }
@@ -278,6 +292,13 @@ export function applyDecayBatch(
       case "fresh":
         // Check if reviving from frozen
         if (engram.status === "frozen") {
+          decayLogger.log({
+            engramId: engram.id,
+            from: "frozen",
+            to: "active",
+            reason: "reinforcement",
+            metadata: { freshness },
+          });
           engram.status = "active";
           result.revived.push(engram.id);
         }
@@ -354,12 +375,26 @@ export async function applyTTLCleanup(
       // Don't delete all - keep at least minRetain
       const canDelete = currentCount - minRetain;
       for (let i = 0; i < canDelete; i++) {
+        decayLogger.log({
+          engramId: items[i].id,
+          from: items[i].status,
+          to: "forgotten",
+          reason: "ttl",
+          metadata: { age: (Date.now() - items[i].lastEffectiveAt) / (1000 * 60 * 60 * 24) },
+        });
         items[i].status = "forgotten";
         result.deleted++;
       }
       result.skipped += wouldDelete - canDelete;
     } else {
       for (const engram of items) {
+        decayLogger.log({
+          engramId: engram.id,
+          from: engram.status,
+          to: "forgotten",
+          reason: "ttl",
+          metadata: { age: (Date.now() - engram.lastEffectiveAt) / (1000 * 60 * 60 * 24) },
+        });
         engram.status = "forgotten";
         result.deleted++;
       }
@@ -403,3 +438,71 @@ export function applyREMPromotion(engrams: Engram[]): {
 
   return { promoted };
 }
+
+// ============================================================================
+// State Transition Logger (for decay visualization)
+// ============================================================================
+
+export interface StateTransitionLog {
+  id: string;
+  engramId: string;
+  from: EngramStatus;
+  to: EngramStatus;
+  reason: "ttl" | "importance" | "access_frequency" | "manual" | "reinforcement";
+  timestamp: number;
+  metadata?: {
+    age?: number;
+    importance?: number;
+    halflife?: number;
+    hotness?: number;
+    freshness?: Freshness;
+  };
+}
+
+export class StateTransitionLogger {
+  private logs: StateTransitionLog[] = [];
+  private maxLogs: number;
+
+  constructor(maxLogs: number = 1000) {
+    this.maxLogs = maxLogs;
+  }
+
+  log(entry: Omit<StateTransitionLog, "id" | "timestamp">): void {
+    const logEntry: StateTransitionLog = {
+      ...entry,
+      id: `stlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: Date.now(),
+    };
+    this.logs.push(logEntry);
+    if (this.logs.length > this.maxLogs) {
+      this.logs = this.logs.slice(-this.maxLogs);
+    }
+  }
+
+  getLogs(engramId?: string, since?: number): StateTransitionLog[] {
+    let result = this.logs;
+    if (engramId) result = result.filter(l => l.engramId === engramId);
+    if (since) result = result.filter(l => l.timestamp >= since);
+    return result;
+  }
+
+  getStats(): {
+    total: number;
+    byReason: Record<string, number>;
+    byTransition: Record<string, number>;
+    recent: StateTransitionLog[];
+  } {
+    const byReason: Record<string, number> = {};
+    const byTransition: Record<string, number> = {};
+    for (const log of this.logs) {
+      byReason[log.reason] = (byReason[log.reason] || 0) + 1;
+      const key = `${log.from}→${log.to}`;
+      byTransition[key] = (byTransition[key] || 0) + 1;
+    }
+    return { total: this.logs.length, byReason, byTransition, recent: this.logs.slice(-10) };
+  }
+
+  clear(): void { this.logs = []; }
+}
+
+export const decayLogger = new StateTransitionLogger();

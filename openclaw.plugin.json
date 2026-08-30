@@ -11,7 +11,8 @@
     "tools": ["mem_new_search", "mem_new_store", "mem_new_get", "mem_new_distill"]
   },
   "hooks": {
-    "allowConversationAccess": true
+    "allowConversationAccess": true,
+    "allowPromptInjection": true
   },
   "name": "Memory New",
   "description": "Multi-layered memory system with decay, team memory, and hybrid retrieval",
@@ -102,6 +103,16 @@
           "backend": { "type": "string", "enum": ["sqlite", "memory"] },
           "dataDir": { "type": "string" }
         }
+      },
+
+      "visualize": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "port": { "type": "number" },
+          "autoStart": { "type": "boolean" }
+        }
       }
     }
   },
@@ -113,11 +124,19 @@
     },
     "layersEnabled": {
       "label": "Memory Layers",
-      "help": "Configure which memory distillation layers to use"
+      "help": "Configure which memory distillation layers to use. L3 (user persona) is OFF by default — the plugin runs a dry-run preview instead and writes it to memory/l3-preview.json. Run `memory_new.l3_dry_run` to inspect."
     },
     "teamMemory": {
       "label": "Team Memory",
       "help": "Enable team memory sharing with visibility ACL and borrow/import limits"
+    },
+    "storage": {
+      "label": "Storage Backend",
+      "help": "memory = JSONL (zero deps, default). sqlite = better-sqlite3 (optionalDependency, falls back to memory if the native binary is missing or mismatched)."
+    },
+    "visualize": {
+      "label": "Visualization Server",
+      "help": "Standalone HTTP dashboard on 127.0.0.1:4123 (or MEMORY_NEW_PORT). Default off. Use `memory_new.visualize start` after enabling."
     }
   }
 }

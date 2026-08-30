@@ -42,14 +42,45 @@ export class SqliteStore {
   private db: any;
   private config: SqliteStoreConfig;
   private closed = false;
+  private ready = false;
 
   constructor(config: SqliteStoreConfig) {
     this.config = config;
   }
 
+  /**
+   * Try to initialize. Returns { ok, error? } instead of throwing so the caller
+   * (storage factory) can fall back to JSONL when better-sqlite3 is missing,
+   * mismatched with the current Node version, or fails to construct.
+   */
+  static async tryInit(
+    config: SqliteStoreConfig
+  ): Promise<{ ok: true; store: SqliteStore } | { ok: false; error: string; code: string }> {
+    const store = new SqliteStore(config);
+    try {
+      await store.init();
+      return { ok: true, store };
+    } catch (e: any) {
+      const code =
+        e?.code === "MODULE_NOT_FOUND" || e?.code === "ERR_MODULE_NOT_FOUND"
+          ? "MODULE_NOT_FOUND"
+          : e?.code === "ERR_DLOPEN_FAILED"
+            ? "NATIVE_BINARY_MISMATCH"
+            : "INIT_FAILED";
+      return { ok: false, error: e?.message ?? String(e), code };
+    }
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+
   async init(): Promise<void> {
-    // Dynamic import for ESM
-    const { default: Database } = await import("better-sqlite3");
+    // Dynamic import for ESM. better-sqlite3 is optionalDependencies so this
+    // may throw MODULE_NOT_FOUND / ERR_DLOPEN_FAILED; callers should use
+    // SqliteStore.tryInit() to fall back gracefully.
+    const DatabaseMod = await import("better-sqlite3");
+    const Database = DatabaseMod.default ?? DatabaseMod;
     const { join } = await import("path");
     const { mkdirSync, chmodSync, existsSync } = await import("fs");
 
@@ -75,6 +106,8 @@ export class SqliteStore {
 
     // Run migrations
     await this.migrate();
+
+    this.ready = true;
   }
 
   private createTables(): void {
@@ -464,8 +497,8 @@ export class SqliteStore {
   }
 
   async close(): Promise<void> {
-    if (!this.closed) {
-      this.db?.close();
+    if (!this.closed && this.ready && this.db) {
+      this.db.close();
       this.closed = true;
     }
   }

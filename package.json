@@ -1,10 +1,13 @@
 {
   "name": "@yhc3577/memory-new",
-  "version": "0.1.13",
+  "version": "0.1.32",
   "description": "Memory New - A new memory extension for OpenClaw",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "memory-new-setup": "./dist/cli-bin.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -22,10 +25,14 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "preuninstall": "node scripts/preuninstall.mjs"
+    "test": "node scripts/test.mjs",
+    "viz:setup": "node scripts/setup-visualize.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.2"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.3.0"
   },
   "peerDependencies": {
     "openclaw": ">=2026.7.0"
