@@ -1,0 +1,123 @@
+{
+  "id": "memory_new",
+  "doctorContract": {
+    "configRepair": true,
+    "stateMigrations": true
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["mem_new_search", "mem_new_store", "mem_new_get", "mem_new_distill"]
+  },
+  "hooks": {
+    "allowConversationAccess": true
+  },
+  "name": "Memory New",
+  "description": "Multi-layered memory system with decay, team memory, and hybrid retrieval",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+
+      "layersEnabled": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "L0": { "type": "boolean" },
+          "L1": { "type": "boolean" },
+          "L2": { "type": "boolean" },
+          "L3": { "type": "boolean" }
+        }
+      },
+
+      "decay": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ttl": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "retentionDays": { "type": "number" },
+              "safetyThreshold": { "type": "number" },
+              "minRetainL0": { "type": "number" },
+              "minRetainL1": { "type": "number" }
+            }
+          },
+          "importance": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "baseHalflifeDays": { "type": "number" }
+            }
+          },
+          "accessFrequency": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" }
+            }
+          },
+          "stateMachine": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" }
+            }
+          }
+        }
+      },
+
+      "teamMemory": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "maxImportedAgents": { "type": "number" },
+          "visibilityGate": { "type": "boolean" }
+        }
+      },
+
+      "retrieval": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hybridSearch": { "type": "boolean" },
+          "semanticWeight": { "type": "number" },
+          "bm25Weight": { "type": "number" },
+          "entityBoostWeight": { "type": "number" },
+          "topK": { "type": "number" },
+          "overFetch": { "type": "number" }
+        }
+      },
+
+      "storage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "backend": { "type": "string", "enum": ["sqlite", "memory"] },
+          "dataDir": { "type": "string" }
+        }
+      }
+    }
+  },
+
+  "uiHints": {
+    "enabled": {
+      "label": "Enable Memory New",
+      "help": "Globally enable or disable the memory plugin"
+    },
+    "layersEnabled": {
+      "label": "Memory Layers",
+      "help": "Configure which memory distillation layers to use"
+    },
+    "teamMemory": {
+      "label": "Team Memory",
+      "help": "Enable team memory sharing with visibility ACL and borrow/import limits"
+    }
+  }
+}
