@@ -21,7 +21,8 @@
     ]
   },
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "preuninstall": "node scripts/preuninstall.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.2"
