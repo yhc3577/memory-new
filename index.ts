@@ -437,6 +437,8 @@ export default definePluginEntry({
           searchL1: (q, limit) => store.searchL1(q, limit),
           getSceneIndex: () => store.getSceneIndex(),
           getPersona: () => store.getPersona(),
+          listL0Recent: (limit) => store.listL0Recent(limit),
+          getScene: (id) => store.getScene(id),
         },
         recall,
         pipeline,

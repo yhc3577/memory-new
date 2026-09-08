@@ -29,6 +29,10 @@ export interface VisualizeServerOptions {
     searchL1: (q: string, limit: number) => Promise<any[]>;
     getSceneIndex: () => Promise<Array<{ id: string; title: string; summary: string }>>;
     getPersona: () => Promise<any>;
+    /** L0 raw messages across all sessions, newest first (drill-down). */
+    listL0Recent: (limit: number) => Promise<any[]>;
+    /** Full L2 scene (markdown body) by id (drill-down expand). */
+    getScene: (id: string) => Promise<any | null>;
   };
   recall: {
     recall: (params: any) => Promise<{
@@ -170,8 +174,30 @@ async function handle(
       return json(res, 200, { logs: opts.decayLogger.getLogs().slice(-100).reverse() });
     case "/api/l1": {
       const limit = clampInt(url.searchParams.get("limit"), 1, 500, 50);
-      const records = await opts.store.searchL1("", limit);
+      const q = url.searchParams.get("q") ?? "";
+      const records = await opts.store.searchL1(q, limit);
       return json(res, 200, { count: records.length, records });
+    }
+    case "/api/l0": {
+      const limit = clampInt(url.searchParams.get("limit"), 1, 500, 200);
+      const records = await opts.store.listL0Recent(limit);
+      return json(res, 200, { count: records.length, records });
+    }
+    case "/api/persona": {
+      const persona = await opts.store.getPersona();
+      return json(res, 200, {
+        present: persona != null,
+        content: persona?.content ?? null,
+        summary: persona?.summary ?? null,
+        updatedAt: persona?.updatedAt ?? null,
+      });
+    }
+    case "/api/scene": {
+      const id = url.searchParams.get("id") ?? "";
+      if (!id) return json(res, 400, { error: "missing id" });
+      const scene = await opts.store.getScene(id);
+      if (!scene) return json(res, 404, { error: "scene not found", id });
+      return json(res, 200, scene);
     }
     case "/api/recall": {
       const q = url.searchParams.get("q") ?? "";

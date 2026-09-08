@@ -29,6 +29,13 @@ OPENCLAW_PROFILE=test npx -p @yhc3577/memory-new memory-new-setup
 
 面板地址为 `http://127.0.0.1:4123`。使用 `memory-new-setup --reset` 可关闭。
 
+面板为全中文界面，支持：
+- **点击统计卡下钻**：点 L0/L1/L2/L3 数量卡即可展开该层完整记忆列表（L0 原始
+  消息 / L1 原子记忆 / L2 场景 / L3 人物画像），可切换层级并按关键词过滤；
+  L2 场景条目点击可展开正文。
+- **人物画像（L3）**：可视化用户画像面板。开启真实写入时读取 `persona.md`；
+  未开启（默认 dry-run）时展示 `l3-preview.json` 的预览并提示如何开启。
+
 > **为什么用独立的 CLI bin，而不是 npm postinstall 钩子或 `openclaw` 命令？**
 > - OpenClaw 出于安全会用 `npm install --ignore-scripts` 安装插件，所以
 >   `package.json` 里的任何 `postinstall` 钩子在 `openclaw plugins install` /

@@ -159,6 +159,34 @@ export class StorageAdapter {
     return messages;
   }
 
+  /**
+   * L0: Read recent messages across ALL sessions, newest first.
+   * Bounds memory by only reading the newest `limit` lines per session file,
+   * then merging + slicing globally. Used by the visualization drill-down.
+   */
+  async listL0Recent(limit: number = 200): Promise<L0Message[]> {
+    const l0Dir = this.resolve(STORAGE_PATHS.l0);
+    if (!existsSync(l0Dir)) return [];
+
+    const files = readdirSync(l0Dir).filter(f => f.endsWith('.jsonl'));
+    const all: L0Message[] = [];
+    for (const file of files) {
+      const content = await this.readFile(`${STORAGE_PATHS.l0}${file}`);
+      if (!content) continue;
+      const lines = content.split("\n").filter(l => l.trim()).slice(-limit);
+      for (const line of lines) {
+        try {
+          all.push(JSON.parse(line) as L0Message);
+        } catch {
+          // Skip malformed lines
+        }
+      }
+    }
+
+    all.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    return all.slice(0, limit);
+  }
+
   // ========== L1 Operations (JSONL) ==========
 
   /**
@@ -261,7 +289,7 @@ updated_at: ${scene.updatedAt}
     }
 
     return {
-      id: scene.id,
+      id: sceneId,
       title: frontmatter.title || "",
       content: lines.slice(frontmatterEnd + 1).join("\n"),
       summary: frontmatter.summary || "",
@@ -711,6 +739,11 @@ export class MemoryStore {
 
   async getMessages(sessionKey: string, limit: number = 100): Promise<L0Message[]> {
     return this.storage.readL0(sessionKey, limit);
+  }
+
+  /** L0 across all sessions, newest first (for the visualization drill-down). */
+  async listL0Recent(limit: number = 200): Promise<L0Message[]> {
+    return this.storage.listL0Recent(limit);
   }
 
   // ========== L1 Operations ==========

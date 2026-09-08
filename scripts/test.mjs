@@ -529,6 +529,30 @@ test("Visualize: server endpoints", async () => {
     agentId: "viz",
   });
 
+  // Seed an L0 raw message + an L2 scene + L3 persona so the drill-down
+  // endpoints (/api/l0, /api/persona, /api/scene) have real data to serve.
+  await store.ingestMessage({
+    content: "用户询问记忆面板的下钻功能",
+    role: "user",
+    sessionKey: "viz-test",
+    sessionId: "viz-test",
+    userId: "viz",
+    agentId: "viz",
+    timestamp: Date.now(),
+  });
+  const drillScene = await store.storeL2({
+    title: "DrillDown Feature Talk",
+    content: "# DrillDown\n\n这是场景正文内容",
+    summary: "讨论记忆下钻功能",
+    tags: ["viz"],
+    metadata: { layer: "L2" },
+  });
+  await store.storeL3({
+    content: "# 人物画像\n\n用户是可视化面板的开发者",
+    summary: "user persona",
+    metadata: { layer: "L3" },
+  });
+
   decayLogger.clear();
 
   const handle = await startVisualizeServer({
@@ -604,6 +628,35 @@ test("Visualize: server endpoints", async () => {
     for (const m of sg.l1Preview) {
       assert(m.id, `l1Preview entry must carry id, got ${JSON.stringify(m)}`);
     }
+
+    // L0 drill-down: newest-first raw messages across sessions.
+    const r8 = await fetch(`${handle.url}/api/l0?limit=50`);
+    const l0 = await r8.json();
+    assert(r8.ok, "/api/l0 should respond");
+    assert(l0.count >= 1 && Array.isArray(l0.records), "l0 returns records array");
+    assert(l0.records.some((r) => r.content.includes("下钻")), "l0 records include seeded message");
+
+    // Persona drill-down: real persona.md content surfaced.
+    const r9 = await fetch(`${handle.url}/api/persona`);
+    const pp = await r9.json();
+    assert(r9.ok, "/api/persona should respond");
+    assert(pp.present === true, "persona present after storeL3 seed");
+    assert((pp.content || "").includes("人物画像"), "persona content includes seeded heading");
+    assert(pp.updatedAt, "persona carries updatedAt");
+
+    // L2 scene detail expand + 404 for unknown id.
+    const r10 = await fetch(`${handle.url}/api/scene?id=${encodeURIComponent(drillScene.id)}`);
+    assert(r10.ok, "/api/scene should return seeded scene");
+    const scDetail = await r10.json();
+    assert(scDetail.id === drillScene.id, "scene detail id matches");
+    assert((scDetail.content || "").includes("场景正文"), "scene detail carries full markdown body");
+    const r11 = await fetch(`${handle.url}/api/scene?id=missing-scene`);
+    assert(r11.status === 404, "unknown scene returns 404");
+
+    // /api/l1 q filter used by drill-down search.
+    const r12 = await fetch(`${handle.url}/api/l1?q=dark+mode&limit=50`);
+    const l1Filtered = await r12.json();
+    assert(l1Filtered.records.length >= 1, "l1 q filter returns matching record");
   } finally {
     await handle.stop();
   }
