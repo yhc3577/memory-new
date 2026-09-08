@@ -53,7 +53,11 @@
             "additionalProperties": false,
             "properties": {
               "enabled": { "type": "boolean" },
-              "baseHalflifeDays": { "type": "number" }
+              "baseHalflifeDays": { "type": "number" },
+              "kindMultipliers": {
+                "type": "object",
+                "additionalProperties": { "type": "number" }
+              }
             }
           },
           "accessFrequency": {
@@ -69,7 +73,8 @@
             "properties": {
               "enabled": { "type": "boolean" }
             }
-          }
+          },
+          "intervalHours": { "type": "number" }
         }
       },
 

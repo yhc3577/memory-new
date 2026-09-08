@@ -10,14 +10,14 @@
  */
 
 import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { MemoryStore, StorageAdapter, RecallEngine, createMemoryStore, createMemoryStoreSync, type L0Message } from "./src/store/storage.js";
+import { MemoryStore, StorageAdapter, RecallEngine, createMemoryStore, createMemoryStoreSync, isL1Recallable, type L0Message, type L1Record } from "./src/store/storage.js";
 import { SqliteStore } from "./src/store/sqlite-store.js";
 import { startVisualizeServer as _startVisualizeServer } from "./src/visualize/visualize-server.js";
 import { runVisualizeSetup, ensureVisualizeAutoStartSync } from "./src/setup/visualize-setup.js";
 import { DistillationPipeline, DEFAULT_DISTILLATION_CONFIG } from "./src/pipeline/distillation.js";
 import { VectorStore } from "./src/vector/vector-store.js";
 import type { EmbeddingProvider } from "openclaw/plugin-sdk/embedding-providers";
-import { applyDecayBatch, applyTTLCleanup, type DecayConfig } from "./src/decay/decay.js";
+import { applyDecayBatch, applyTTLCleanup, DEFAULT_DECAY_CONFIG, FORGET_IMPORTANCE_THRESHOLD, type DecayConfig } from "./src/decay/decay.js";
 import { TeamMemoryManager, TeamEventStore } from "./src/team/team-memory.js";
 
 // ============================================================================
@@ -111,6 +111,8 @@ export interface MemoryNewConfig {
     importance: {
       enabled: boolean;
       baseHalflifeDays: number;
+      /** kind → half-life multiplier; overrides decay.ts defaults per kind. */
+      kindMultipliers?: Record<string, number>;
     };
     accessFrequency: {
       enabled: boolean;
@@ -118,6 +120,8 @@ export interface MemoryNewConfig {
     stateMachine: {
       enabled: boolean;
     };
+    /** Hours between periodic decay runs (beyond session_end). Default 6; ≤0 disables. */
+    intervalHours?: number;
   };
 
   // Team memory
@@ -189,6 +193,7 @@ const DEFAULT_CONFIG: MemoryNewConfig = {
     importance: { enabled: true, baseHalflifeDays: 50 },
     accessFrequency: { enabled: true },
     stateMachine: { enabled: true },
+    intervalHours: 6,
   },
   teamMemory: {
     enabled: true,
@@ -280,91 +285,155 @@ function genId(): string {
 // ============================================================================
 
 interface DecayResult {
-  deleted: number;
-  frozen: number;
-  revived: number;
+  scanned: number;            // active records evaluated by the state machine
+  deleted: number;            // total forgotten (state machine + TTL)
+  frozen: number;             // total frozen
+  revived: number;            // always 0 under Co-Engram semantics (no auto-revive)
+  forgottenIds: string[];
+  frozenIds: string[];
+  revivedIds: string[];
+}
+
+/** L1 type → decay kind (Co-Engram kind drives the half-life multiplier). */
+const L1_TYPE_TO_KIND: Record<L1Record["type"], EngramKind> = {
+  persona: "fact",
+  episodic: "observation",
+  instruction: "procedure",
+};
+
+/** User kindMultipliers win per-kind; decay.ts defaults fill the rest. */
+function mergeKindMultipliers(user?: Record<string, number>): Record<string, number> {
+  return { ...DEFAULT_DECAY_CONFIG.importance.kindMultipliers, ...(user ?? {}) };
+}
+
+/** L1 → decay Engram using persisted decay state or backfill defaults. */
+function toEngram(r: L1Record): Engram {
+  const createdAtMs = new Date(r.createdAt).getTime() || Date.now();
+  const updatedAtMs = new Date(r.updatedAt).getTime() || createdAtMs;
+  return {
+    id: r.id,
+    kind: r.kind ?? L1_TYPE_TO_KIND[r.type] ?? "fact",
+    status: r.status ?? "active",
+    visibility: "private",
+    verification: "probable",
+    content: r.content,
+    importance: r.importance ?? r.priority / 100,
+    lastEffectiveAt: r.lastEffectiveAt ?? createdAtMs,
+    metadata: r.metadata,
+    tags: [],
+    contextTags: [],
+    source: "memory",
+    createdAt: createdAtMs,
+    updatedAt: updatedAtMs,
+    createdBy: r.userId,
+    trustLevel: "external",
+    synapses: [],
+  };
+}
+
+/** Full DecayConfig that state-machine + TTL passes run under. */
+function toDecayConfig(decayConfig: MemoryNewConfig["decay"]): DecayConfig {
+  return {
+    ttl: {
+      enabled: decayConfig.ttl.enabled,
+      retentionDays: decayConfig.ttl.retentionDays,
+      safetyThreshold: decayConfig.ttl.safetyThreshold,
+      minRetainL0: decayConfig.ttl.minRetainL0,
+      minRetainL1: decayConfig.ttl.minRetainL1,
+    },
+    importance: {
+      enabled: decayConfig.importance.enabled,
+      baseHalflifeDays: decayConfig.importance.baseHalflifeDays,
+      kindMultipliers: mergeKindMultipliers(decayConfig.importance.kindMultipliers),
+    },
+    accessFrequency: { enabled: decayConfig.accessFrequency.enabled },
+    stateMachine: { enabled: decayConfig.stateMachine.enabled },
+  };
+}
+
+function emptyDecayResult(): DecayResult {
+  return { scanned: 0, deleted: 0, frozen: 0, revived: 0, forgottenIds: [], frozenIds: [], revivedIds: [] };
 }
 
 /**
- * Apply decay mechanisms to L1 memories
+ * Run decay over ALL L1 rows and PERSIST every status flip.
+ *
+ * Pipeline (Co-Engram order):
+ *   1. listAllL1() — uncapped population
+ *   2. state-machine batch (active-only) → forget / freeze
+ *   3. TTL cleanup — forget active rows older than retentionDays (frozen survive)
+ *   4. diff each engram's status against its persisted base → applyDecayStatus()
+ *
+ * Only { status } is written back, never updatedAt, so the "content changed"
+ * timestamp keeps its meaning. No-op when both stateMachine and ttl are off.
  */
 async function applyDecayToL1(store: MemoryStore, decayConfig: MemoryNewConfig["decay"]): Promise<DecayResult> {
-  const result: DecayResult = { deleted: 0, frozen: 0, revived: 0 };
-
-  try {
-    // Get all L1 records
-    const l1Records = await store.searchL1("", 1000);
-
-    // Convert to Engram format for decay
-    const engrams: Engram[] = l1Records.map(r => ({
-      id: r.id,
-      kind: "fact" as const,
-      status: "active" as const,
-      visibility: "private" as const,
-      verification: "probable" as const,
-      content: r.content,
-      importance: r.priority / 100,
-      lastEffectiveAt: new Date(r.updatedAt).getTime(),
-      metadata: r.metadata,
-      tags: [],
-      contextTags: [],
-      source: "memory",
-      createdAt: new Date(r.createdAt).getTime(),
-      updatedAt: new Date(r.updatedAt).getTime(),
-      createdBy: r.userId,
-      trustLevel: "external" as const,
-      synapses: [],
-    }));
-
-    // Apply state machine decay
-    if (decayConfig.stateMachine.enabled) {
-      const decayResult = applyDecayBatch(engrams, {
-        ttl: { enabled: false, retentionDays: 0, safetyThreshold: 0, minRetainL0: 0, minRetainL1: 0 },
-        importance: { enabled: true, baseHalflifeDays: decayConfig.importance.baseHalflifeDays, kindMultipliers: {} },
-        accessFrequency: { enabled: decayConfig.accessFrequency.enabled },
-        stateMachine: { enabled: true },
-      });
-      result.deleted += decayResult.forgotten.length;
-      result.frozen += decayResult.frozen.length;
-      result.revived += decayResult.revived.length;
-    }
-
-    // Apply TTL cleanup
-    if (decayConfig.ttl.enabled) {
-      const ttlResult = await applyTTLCleanup(
-        engrams,
-        { L0: 0, L1: l1Records.length, L2: 0, L3: 0 },
-        {
-          ttl: {
-            enabled: true,
-            retentionDays: decayConfig.ttl.retentionDays,
-            safetyThreshold: decayConfig.ttl.safetyThreshold,
-            minRetainL0: decayConfig.ttl.minRetainL0,
-            minRetainL1: decayConfig.ttl.minRetainL1,
-          },
-          importance: { enabled: false, baseHalflifeDays: 0, kindMultipliers: {} },
-          accessFrequency: { enabled: false },
-          stateMachine: { enabled: false },
-        }
-      );
-      result.deleted += ttlResult.deleted;
-    }
-
-    // Update records based on decay results
-    for (const engram of engrams) {
-      if (engram.status === "forgotten") {
-        // Mark as deleted - would need deleteL1 method
-        // For now, just log it
-        console.log(`[memory_new] Decay: forgetting ${engram.id}`);
-      } else if (engram.status === "frozen") {
-        console.log(`[memory_new] Decay: freezing ${engram.id}`);
-      }
-    }
-  } catch (error) {
-    console.error(`[memory_new] Decay error: ${error}`);
+  if (!decayConfig.stateMachine.enabled && !decayConfig.ttl.enabled) {
+    return emptyDecayResult();
   }
 
-  return result;
+  try {
+    // 1. Full population (no 1000 cap — decay must see every row)
+    const l1Records = await store.listAllL1();
+    if (l1Records.length === 0) return emptyDecayResult();
+
+    const fullConfig = toDecayConfig(decayConfig);
+    const engrams = l1Records.map(toEngram);
+
+    // Persisted (pre-run) status per id + sessionKey per id for write-back.
+    const baseStatus = new Map<string, EngramStatus>();
+    const sessionByRecord = new Map<string, string>();
+    for (const r of l1Records) {
+      baseStatus.set(r.id, r.status ?? "active");
+      sessionByRecord.set(r.id, r.sessionKey);
+    }
+
+    // 2. State-machine batch (only active rows are considered)
+    const batchResult = applyDecayBatch(engrams, fullConfig);
+
+    // 3. TTL cleanup — separate pass so frozen rows from (2) survive it.
+    const nonForgottenCount = l1Records.filter(r => (r.status ?? "active") !== "forgotten").length;
+    if (fullConfig.ttl.enabled) {
+      await applyTTLCleanup(engrams, { L0: 0, L1: nonForgottenCount, L2: 0, L3: 0 }, fullConfig);
+    }
+
+    // 4. Diff status vs persisted base → build one write-back per session file.
+    const updates: Array<{ sessionKey: string; id: string; patch: Partial<L1Record> }> = [];
+    const forgottenIds = [...batchResult.forgotten];
+    const frozenIds = [...batchResult.frozen];
+    const revivedIds = [...batchResult.revived];
+    for (const eng of engrams) {
+      const base = baseStatus.get(eng.id) ?? "active";
+      if (eng.status !== base) {
+        const sessionKey = sessionByRecord.get(eng.id);
+        if (sessionKey) {
+          updates.push({ sessionKey, id: eng.id, patch: { status: eng.status } });
+        }
+        if (eng.status === "forgotten" && !forgottenIds.includes(eng.id)) forgottenIds.push(eng.id);
+        if (eng.status === "frozen" && !frozenIds.includes(eng.id)) frozenIds.push(eng.id);
+      }
+    }
+
+    if (updates.length > 0) {
+      const applied = await store.applyDecayStatus(updates);
+      if (applied !== updates.length) {
+        console.warn(`[memory_new] Decay persisted ${applied}/${updates.length} status flips`);
+      }
+    }
+
+    return {
+      scanned: batchResult.scanned,
+      deleted: forgottenIds.length,
+      frozen: frozenIds.length,
+      revived: revivedIds.length,
+      forgottenIds,
+      frozenIds,
+      revivedIds,
+    };
+  } catch (error) {
+    console.error(`[memory_new] Decay error: ${error}`);
+    return emptyDecayResult();
+  }
 }
 
 // ============================================================================
@@ -579,6 +648,96 @@ export default definePluginEntry({
     const sessionMessages = new Map<string, any[]>();
 
     // =========================================================================
+    // Decay runner (session_end + periodic timer, serialized by a reentry lock)
+    // =========================================================================
+
+    let decayInFlight = false;
+
+    async function runDecay(reason: "session_end" | "timer" | "command" = "session_end"): Promise<DecayResult> {
+      if (!config.enabled) return emptyDecayResult();
+      if (decayInFlight) {
+        api.logger.debug?.(`[memory_new] Decay(${reason}) skipped: another run in flight`);
+        return emptyDecayResult();
+      }
+      decayInFlight = true;
+      try {
+        const result = await applyDecayToL1(store, config.decay);
+        if (result.deleted > 0 || result.frozen > 0) {
+          api.logger.info?.(
+            `[memory_new] Decay(${reason}): scanned=${result.scanned} forgotten=${result.deleted} frozen=${result.frozen}`,
+          );
+        } else {
+          api.logger.debug?.(`[memory_new] Decay(${reason}): no state changes (scanned=${result.scanned})`);
+        }
+        return result;
+      } catch (e) {
+        api.logger.debug?.(`[memory_new] Decay(${reason}) failed: ${e}`);
+        return emptyDecayResult();
+      } finally {
+        decayInFlight = false;
+      }
+    }
+
+    let decayTimer: ReturnType<typeof setInterval> | null = null;
+
+    function startDecayTimer(): void {
+      if (decayTimer) return;
+      const intervalHours = config.decay.intervalHours ?? 6;
+      if (!(intervalHours > 0)) return;
+      decayTimer = setInterval(() => {
+        runDecay("timer").catch(() => {});
+      }, intervalHours * 60 * 60 * 1000);
+      if (typeof (decayTimer as any)?.unref === "function") {
+        (decayTimer as any).unref();
+      }
+      api.logger.debug?.(
+        `[memory_new] Periodic decay timer armed (every ${intervalHours}h)`,
+      );
+    }
+
+    function stopDecayTimer(): void {
+      if (decayTimer) {
+        clearInterval(decayTimer);
+        decayTimer = null;
+      }
+    }
+
+    // If the host exposes runtime lifecycle, tear the timer down on unload so a
+    // gateway restart / plugin disable doesn't leave a stray interval. Older
+    // gateways that lack registerRuntimeLifecycle are covered by the process
+    // ending on restart.
+    api.registerRuntimeLifecycle?.({
+      id: "memory_new_decay_timer",
+      description: "Periodic memory decay timer",
+      cleanup: () => {
+        stopDecayTimer();
+      },
+    });
+
+    /**
+     * Fire-and-forget LTP reinforcement for a successful recall: bump the hit
+     * rows' retrievalCount + lastEffectiveAt so used memories stay alive.
+     * Never awaited — recall must not block on persistence. Only meaningful
+     * when importance-driven decay is on (it feeds the freshness clock).
+     */
+    function reinforceRecalled(recallResult: {
+      recalledL1Memories?: Array<{ id: string; sessionKey: string }>;
+    } | undefined): void {
+      if (!config.decay.importance.enabled) return;
+      const mems = recallResult?.recalledL1Memories;
+      if (!mems || mems.length === 0) return;
+      const hits = mems.map(m => ({ sessionKey: m.sessionKey, id: m.id }));
+      store
+        .markRecalled(hits)
+        .then(n => {
+          if (n > 0) api.logger.debug?.(`[memory_new] Reinforced ${n}/${hits.length} recalled memories`);
+        })
+        .catch(() => {
+          // non-blocking; a missed reinforcement is harmless
+        });
+    }
+
+    // =========================================================================
     // Commands
     // =========================================================================
 
@@ -628,6 +787,8 @@ export default definePluginEntry({
               topK: config.retrieval.topK,
             });
 
+            reinforceRecalled(result);
+
             if (!result.prependContext && !result.appendSystemContext) {
               return { text: "No relevant memories found." };
             }
@@ -655,8 +816,23 @@ export default definePluginEntry({
           }
 
           case "decay": {
-            // Apply decay - placeholder
-            return { text: "Decay is not yet fully implemented." };
+            const result = await runDecay("command");
+            const lines = [
+              `Decay run complete:`,
+              `  scanned:   ${result.scanned}`,
+              `  forgotten: ${result.deleted}`,
+              `  frozen:    ${result.frozen}`,
+              `  revived:   ${result.revived}`,
+            ];
+            if (result.forgottenIds.length > 0) {
+              const shown = result.forgottenIds.slice(0, 20).join(", ");
+              lines.push(`  forgotten ids: ${shown}${result.forgottenIds.length > 20 ? ", …" : ""}`);
+            }
+            if (result.frozenIds.length > 0) {
+              const shown = result.frozenIds.slice(0, 20).join(", ");
+              lines.push(`  frozen ids: ${shown}${result.frozenIds.length > 20 ? ", …" : ""}`);
+            }
+            return { text: lines.join("\n") };
           }
 
           case "stats": {
@@ -678,10 +854,11 @@ export default definePluginEntry({
             return {
               text: `Memory New commands:
   mem add <content>         - Add a memory
-  mem search <query>       - Search memories
-  mem list                 - List recent memories
-  mem stats                - Show memory statistics
-  mem config               - Show configuration
+  mem search <query>        - Search memories
+  mem list                  - List recent memories
+  mem stats                 - Show memory statistics
+  mem decay                 - Run a decay pass now
+  mem config                - Show configuration
 
 Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
             };
@@ -1175,6 +1352,9 @@ Generated: ${new Date().toISOString()}
 
         api.logger.info?.(`[memory_new] recallResult: strategy=${recallResult.recallStrategy}, memories=${recallResult.recalledL1Memories?.length ?? 0}`);
 
+        // Refresh the recalled memories' effective time so they "stay alive".
+        reinforceRecalled(recallResult);
+
         // If no memories, skip
         if (!recallResult.prependContext && !recallResult.appendSystemContext) {
           api.logger.debug?.(`[memory_new] No memories found for query: "${query}"`);
@@ -1244,12 +1424,9 @@ Generated: ${new Date().toISOString()}
       const sessionKey = ctx.sessionKey ?? "default";
 
       try {
-        // Apply decay if enabled
+        // Apply decay if enabled (serialized against the periodic timer)
         if (config.decay.stateMachine.enabled || config.decay.ttl.enabled) {
-          const decayResult = await applyDecayToL1(store, config.decay);
-          if (decayResult.deleted > 0 || decayResult.frozen > 0) {
-            api.logger.info?.(`[memory_new] Decay: deleted=${decayResult.deleted}, frozen=${decayResult.frozen}`);
-          }
+          await runDecay("session_end");
         }
 
         // Trigger L2/L3 distillation if enabled
@@ -1316,6 +1493,8 @@ Generated: ${new Date().toISOString()}
           agentId: "self",
           topK: params.limit ?? 10,
         });
+
+        reinforceRecalled(result);
 
         return {
           memories: result.recalledL1Memories ?? [],
@@ -1547,6 +1726,12 @@ Generated: ${new Date().toISOString()}
       },
     });
 
+    // Arm the periodic decay timer once everything is wired up. The runtime
+    // lifecycle cleanup (registered above) stops it on unload.
+    if (config.decay.stateMachine.enabled || config.decay.ttl.enabled) {
+      startDecayTimer();
+    }
+
     api.logger.info?.("Memory New plugin registered with storage and pipeline");
 
     // Auto-configure plugin settings when installed
@@ -1572,9 +1757,14 @@ Generated: ${new Date().toISOString()}
               storage: { backend: "memory", dataDir: "~/.openclaw/memory-new" },
               decay: {
                 ttl: { enabled: true, retentionDays: 30, safetyThreshold: 0.8, minRetainL0: 50, minRetainL1: 20 },
-                importance: { enabled: true, baseHalflifeDays: 50 },
+                importance: {
+                  enabled: true,
+                  baseHalflifeDays: 50,
+                  kindMultipliers: { observation: 0.6, hypothesis: 0.7, procedure: 0.8, fact: 1.0, pattern: 1.5 },
+                },
                 accessFrequency: { enabled: true },
                 stateMachine: { enabled: true },
+                intervalHours: 6,
               },
               teamMemory: { enabled: true, maxImportedAgents: 2, visibilityGate: true },
             },
@@ -1633,6 +1823,10 @@ export const testing = {
   // Decay functions
   applyDecayBatch,
   applyTTLCleanup,
+  applyDecayToL1,
+  toDecayConfig,
+  FORGET_IMPORTANCE_THRESHOLD,
+  isL1Recallable,
   deriveFreshness: deriveFreshnessOriginal,
   deriveHotness,
   calculateScore,

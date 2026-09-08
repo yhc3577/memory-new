@@ -10,8 +10,11 @@
  */
 
 import { testing } from "../dist/index.js";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-const { VectorStore, MemoryStore, StorageAdapter, DistillationPipeline, DEFAULT_DISTILLATION_CONFIG, TeamMemoryManager, TeamEventStore, applyDecayBatch, deriveFreshness, deriveHotness, decayLogger, StateTransitionLogger, startVisualizeServer, RecallEngine, runVisualizeSetup } = testing;
+const { VectorStore, MemoryStore, StorageAdapter, DistillationPipeline, DEFAULT_DISTILLATION_CONFIG, TeamMemoryManager, TeamEventStore, applyDecayBatch, applyTTLCleanup, applyDecayToL1, toDecayConfig, deriveFreshness, deriveHotness, decayLogger, StateTransitionLogger, startVisualizeServer, RecallEngine, runVisualizeSetup, isL1Recallable } = testing;
 
 // Test utilities
 const tests = [];
@@ -321,8 +324,13 @@ test("Decay: State machine transitions", () => {
   };
 
   const result = applyDecayBatch(engrams, config);
-  // With 100 days and 7 day halflife, should be forgotten
-  assert(result.forgotten.length > 0 || result.frozen.length > 0, "Old low-importance memory should be forgotten/frozen");
+  // fact @ imp 0.8 → halflife = 7×0.9^1.5 ≈ 6d; 4×≈24d < 100d → freshness=forgotten
+  // → forgotten regardless of importance (Co-Engram)
+  assert(result.scanned === 1, `Exactly 1 active record scanned, got ${result.scanned}`);
+  assert(result.forgotten.includes("test1"), "100d old active memory should be forgotten");
+  assert(result.frozen.length === 0, "forgotten band is terminal — never frozen");
+  assert(result.revived.length === 0, "no auto-revive");
+  assert(engrams[0].status === "forgotten", "engram mutated to forgotten");
 });
 
 // ============================================================================
@@ -396,11 +404,294 @@ test("Decay: Logger integration with decay batch", () => {
 
   const result = applyDecayBatch(engrams, config);
 
-  // With 200 days and 7 day halflife: halflife * 4 = 28 days, so should be forgotten
-  if (result.forgotten.length > 0) {
-    const logs = logger.getLogs("old-engram");
-    assert(logs.length > 0, "Should log forgotten transition");
-    assert(logs[logs.length - 1].to === "forgotten", "Should be forgotten");
+  // With 200 days and 7 day halflife: halflife * 4 ≈ 24 days, so should be forgotten
+  assert(result.scanned === 1, `Exactly 1 active record scanned, got ${result.scanned}`);
+  assert(result.forgotten.includes("old-engram"), "200d old memory should be forgotten");
+  const logs = logger.getLogs("old-engram");
+  assert(logs.length > 0, "Should log forgotten transition");
+  assert(logs[logs.length - 1].to === "forgotten", "Last transition should be to forgotten");
+});
+
+// --- Decay persistence / Co-Engram helpers ---
+const DAY_MS = 24 * 60 * 60 * 1000;
+let decayTmpCounter = 0;
+function uniqueStoreDir(prefix) {
+  return join(tmpdir(), `${prefix}-${process.pid}-${Date.now()}-${decayTmpCounter++}`);
+}
+
+const DECAY_CFG = {
+  ttl: { enabled: true, retentionDays: 30, safetyThreshold: 0.8, minRetainL0: 50, minRetainL1: 20 },
+  importance: { enabled: true, baseHalflifeDays: 50 },
+  accessFrequency: { enabled: true },
+  stateMachine: { enabled: true },
+};
+
+function makeL1Seed(overrides = {}) {
+  const now = new Date().toISOString();
+  return {
+    id: `l1_${Math.random().toString(36).slice(2, 9)}`,
+    content: "种子记忆内容",
+    type: "episodic",
+    priority: 50,
+    sceneName: "Seed",
+    sourceMessageIds: [],
+    metadata: {},
+    timestamps: [],
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+    sessionKey: "decay-session",
+    sessionId: "decay-session",
+    userId: "tester",
+    agentId: "self",
+    ...overrides,
+  };
+}
+
+async function seedL1(dir, record) {
+  await new StorageAdapter(dir).appendL1(record);
+}
+
+function makeActiveEngram(id, ageDays, importance = 0.5) {
+  return {
+    id,
+    kind: "fact",
+    status: "active",
+    visibility: "private",
+    verification: "probable",
+    content: "Test",
+    importance,
+    lastEffectiveAt: Date.now() - ageDays * DAY_MS,
+    metadata: {},
+    tags: [],
+    contextTags: [],
+    source: "test",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    createdBy: "test",
+    trustLevel: "direct",
+    synapses: [],
+  };
+}
+
+// ============================================================================
+// Test: Decay — Co-Engram semantics (pure)
+// ============================================================================
+
+test("Decay: Co-Engram stale split (freeze high importance, forget low)", () => {
+  const config = {
+    ttl: { enabled: false, retentionDays: 0, safetyThreshold: 0, minRetainL0: 0, minRetainL1: 0 },
+    importance: { enabled: true, baseHalflifeDays: 10, kindMultipliers: {} },
+    accessFrequency: { enabled: false },
+    stateMachine: { enabled: true },
+  };
+  // imp 0.15 fact → hl = 10×0.25^1.5 ≈ 1.25d; stale band (2×..4×) = (2.5, 5]d → age 3d is stale
+  const low = makeActiveEngram("low-split", 3, 0.15);
+  // imp 0.8 fact → hl = 10×0.9^1.5 ≈ 8.5d; stale band ≈ (17, 34]d → age 25d is stale
+  const high = makeActiveEngram("high-split", 25, 0.8);
+
+  const result = applyDecayBatch([low, high], config);
+  assert(result.scanned === 2, `2 active scanned, got ${result.scanned}`);
+  assert(result.forgotten.includes("low-split"), "stale + importance<0.2 → forgotten");
+  assert(result.frozen.includes("high-split"), "stale + importance≥0.2 → frozen (archive)");
+  assert(low.status === "forgotten", "low engram mutated to forgotten");
+  assert(high.status === "frozen", "high engram mutated to frozen");
+});
+
+test("Decay: freshness=forgotten ignores importance (always forget)", () => {
+  const config = {
+    ttl: { enabled: false, retentionDays: 0, safetyThreshold: 0, minRetainL0: 0, minRetainL1: 0 },
+    importance: { enabled: true, baseHalflifeDays: 10, kindMultipliers: {} },
+    accessFrequency: { enabled: false },
+    stateMachine: { enabled: true },
+  };
+  // imp 0.95 fact → hl = 10×1.05^1.5 ≈ 10.8d; 4×≈43d < 100d → forgotten band
+  const engram = makeActiveEngram("very-old-high", 100, 0.95);
+  const result = applyDecayBatch([engram], config);
+  assert(result.forgotten.includes("very-old-high"), "forgotten band forgets even high importance");
+  assert(result.frozen.length === 0, "no freeze from forgotten band");
+});
+
+test("Decay: only active decays; frozen never auto-revives", () => {
+  const config = {
+    ttl: { enabled: false, retentionDays: 0, safetyThreshold: 0, minRetainL0: 0, minRetainL1: 0 },
+    importance: { enabled: true, baseHalflifeDays: 10, kindMultipliers: {} },
+    accessFrequency: { enabled: false },
+    stateMachine: { enabled: true },
+  };
+  const freshFrozen = { ...makeActiveEngram("frz-fresh", 0), status: "frozen" };
+  const oldFrozen = { ...makeActiveEngram("frz-old", 200), status: "frozen" }; // would forget if scanned
+  const oldDraft = { ...makeActiveEngram("draft-old", 200), status: "draft" };
+  const result = applyDecayBatch([freshFrozen, oldFrozen, oldDraft], config);
+  assert(result.scanned === 0, "no active records → nothing scanned");
+  assert(result.forgotten.length === 0 && result.frozen.length === 0, "frozen/draft untouched");
+  assert(result.revived.length === 0, "frozen is terminal — no auto-revive");
+  assert(oldFrozen.status === "frozen", "old frozen stays frozen (never silently forgotten)");
+});
+
+test("Decay: deriveFreshness falls back to createdAt, invalid → fresh", () => {
+  const config = {
+    ttl: { enabled: false, retentionDays: 0, safetyThreshold: 0, minRetainL0: 0, minRetainL1: 0 },
+    importance: { enabled: true, baseHalflifeDays: 10, kindMultipliers: {} },
+    accessFrequency: { enabled: false },
+    stateMachine: { enabled: true },
+  };
+  const now = Date.now();
+  // lastEffectiveAt invalid + old createdAt → age from createdAt (imp0.5 fact hl≈4.6d → 60d forgotten)
+  const fromCreated = deriveFreshness(NaN, 0.5, "fact", config, { now, createdAt: now - 60 * DAY_MS });
+  assert(fromCreated === "forgotten", `should fall back to createdAt (got ${fromCreated})`);
+  // No usable reference point at all → treat as brand-new
+  const noRef = deriveFreshness(NaN, 0.5, "fact", config, { now });
+  assert(noRef === "fresh", `invalid + no createdAt → fresh (got ${noRef})`);
+});
+
+test("Decay: TTL min-retain forgets oldest, keeps newest", async () => {
+  const config = {
+    ttl: { enabled: true, retentionDays: 1, safetyThreshold: 1.0, minRetainL0: 0, minRetainL1: 2 },
+    importance: { enabled: true, baseHalflifeDays: 50, kindMultipliers: {} },
+    accessFrequency: { enabled: false },
+    stateMachine: { enabled: true },
+  };
+  const list = [
+    makeActiveEngram("t-1", 60),
+    makeActiveEngram("t-2", 50),
+    makeActiveEngram("t-3", 40),
+    makeActiveEngram("t-4", 30),
+    makeActiveEngram("t-5", 20),
+  ];
+  const res = await applyTTLCleanup(list, { L0: 0, L1: 5, L2: 0, L3: 0 }, config);
+  assert(res.deleted === 3, `should forget exactly 3 (5 - minRetain 2), got ${res.deleted}`);
+  const remainIds = list.filter(e => e.status === "active").map(e => e.id).sort();
+  assert(JSON.stringify(remainIds) === JSON.stringify(["t-4", "t-5"]), `newest survive, got ${remainIds.join(",")}`);
+});
+
+// ============================================================================
+// Test: Decay — persistence (store level)
+// ============================================================================
+
+test("Decay: applyDecayStatus persists status and never touches updatedAt", async () => {
+  const dir = uniqueStoreDir("persist");
+  try {
+    const store = new MemoryStore(dir);
+    const rec = makeL1Seed({ id: "persist-1", sessionKey: "p-session", content: "持久化 关键词" });
+    await seedL1(dir, rec);
+
+    const n = await store.applyDecayStatus([
+      { sessionKey: "p-session", id: "persist-1", patch: { status: "frozen" } },
+    ]);
+    assert(n === 1, `should apply exactly 1 patch, got ${n}`);
+
+    const all = await store.listAllL1(); // re-reads from disk
+    const row = all.find(r => r.id === "persist-1");
+    assert(row.status === "frozen", "status persisted to disk");
+    assert(row.updatedAt === rec.updatedAt, "updatedAt must NOT change on a status flip");
+    assert(row.createdAt === rec.createdAt, "createdAt unchanged");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Decay: applyDecayToL1 end-to-end — stale split persists + fresh survives", async () => {
+  const dir = uniqueStoreDir("e2e");
+  try {
+    const store = new MemoryStore(dir);
+    const now = Date.now();
+    const iso = (ms) => new Date(ms).toISOString();
+    // persona → fact multiplier 1.0; imp 0.9 → hl = 50d; age 150d = stale → frozen
+    const hi = makeL1Seed({
+      id: "hi", type: "persona", priority: 90, importance: 0.9,
+      content: "高价值 共享关键词", sessionKey: "e2e-session",
+      lastEffectiveAt: now - 150 * DAY_MS,
+      createdAt: iso(now - 150 * DAY_MS), updatedAt: iso(now - 150 * DAY_MS),
+    });
+    // episodic → observation multiplier 0.6; imp 0.15 → hl ≈ 3.75d; age 15d = 4× → stale → forgotten
+    const lo = makeL1Seed({
+      id: "lo", type: "episodic", priority: 15, importance: 0.15,
+      content: "低价值 共享关键词", sessionKey: "e2e-session",
+      lastEffectiveAt: now - 15 * DAY_MS,
+      createdAt: iso(now - 15 * DAY_MS), updatedAt: iso(now - 15 * DAY_MS),
+    });
+    const fresh = makeL1Seed({ id: "fresh", content: "新记忆 共享关键词", sessionKey: "e2e-session" });
+    await seedL1(dir, hi);
+    await seedL1(dir, lo);
+    await seedL1(dir, fresh);
+
+    const result = await applyDecayToL1(store, DECAY_CFG);
+    assert(result.frozenIds.includes("hi"), "hi should freeze (stale + high importance)");
+    assert(result.forgottenIds.includes("lo"), "lo should be forgotten (stale + low importance)");
+    assert(result.frozen === 1 && result.deleted === 1, `counts frozen=${result.frozen} forgotten=${result.deleted}`);
+
+    const byId = new Map((await store.listAllL1()).map(r => [r.id, r]));
+    assert(byId.get("hi").status === "frozen", "hi persisted frozen");
+    assert(byId.get("lo").status === "forgotten", "lo persisted forgotten");
+    // Fresh row has no persisted status field → defaults to active
+    assert((byId.get("fresh").status ?? "active") === "active", "fresh memory stays active (default)");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Decay: recall excludes frozen/forgotten and exposes id+sessionKey", async () => {
+  const dir = uniqueStoreDir("recall");
+  try {
+    const store = new MemoryStore(dir);
+    const active = makeL1Seed({ id: "act", content: "用户偏好 蓝色主题", sessionKey: "r-session" });
+    const frozen = makeL1Seed({ id: "frz", content: "用户偏好 蓝色主题", sessionKey: "r-session", status: "frozen" });
+    const forgotten = makeL1Seed({ id: "fg", content: "用户偏好 蓝色主题", sessionKey: "r-session", status: "forgotten" });
+    await seedL1(dir, active);
+    await seedL1(dir, frozen);
+    await seedL1(dir, forgotten);
+
+    const engine = new RecallEngine(new StorageAdapter(dir));
+    const result = await engine.recall({ query: "蓝色主题", sessionKey: "r-session", userId: "u", agentId: "a", topK: 10 });
+    const mems = result.recalledL1Memories ?? [];
+    const ids = mems.map(m => m.id);
+    assert(ids.includes("act"), "active memory should be recalled");
+    assert(!ids.includes("frz"), "frozen memory must be excluded from recall");
+    assert(!ids.includes("fg"), "forgotten memory must be excluded from recall");
+    assert(mems.every(m => m.id && m.sessionKey), "each recalled memory exposes id + sessionKey");
+    assert(mems[0].sessionKey === "r-session", "sessionKey flows through to recall result");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Decay: markRecalled bumps active only, debounced by default", async () => {
+  const dir = uniqueStoreDir("markrecalled");
+  try {
+    const store = new MemoryStore(dir);
+    const now = Date.now();
+    const active = makeL1Seed({ id: "hit-active", content: "强化 关键词", sessionKey: "mr-session", lastEffectiveAt: now - 5 * DAY_MS });
+    const frozen = makeL1Seed({ id: "hit-frozen", content: "强化 关键词", sessionKey: "mr-session", status: "frozen", lastEffectiveAt: now - 100 * DAY_MS });
+    await seedL1(dir, active);
+    await seedL1(dir, frozen);
+
+    const n1 = await store.markRecalled([
+      { sessionKey: "mr-session", id: "hit-active" },
+      { sessionKey: "mr-session", id: "hit-frozen" },
+    ]);
+    assert(n1 === 1, `only the active row should be bumped, got ${n1}`);
+
+    let byId = new Map((await store.listAllL1()).map(r => [r.id, r]));
+    assert(byId.get("hit-active").retrievalCount === 1, "active retrievalCount should be 1");
+    assert(byId.get("hit-frozen").retrievalCount === undefined, "frozen must never be bumped (no resurrection)");
+    const firstHitAt = byId.get("hit-active").lastRetrievedAt;
+
+    // Second hit within the 60s debounce window → no-op
+    const n2 = await store.markRecalled([{ sessionKey: "mr-session", id: "hit-active" }]);
+    assert(n2 === 0, `debounced hit should bump 0, got ${n2}`);
+
+    // Bypassing the debounce bumps again → retrievalCount 2
+    const n3 = await store.markRecalled([{ sessionKey: "mr-session", id: "hit-active" }], 0);
+    assert(n3 === 1, `debounce-bypassed hit should bump 1, got ${n3}`);
+    byId = new Map((await store.listAllL1()).map(r => [r.id, r]));
+    const after = byId.get("hit-active");
+    assert(after.retrievalCount === 2, `retrievalCount should be 2, got ${after.retrievalCount}`);
+    assert(after.lastRetrievedAt >= firstHitAt, "lastRetrievedAt should advance");
+    assert(after.lastEffectiveAt >= firstHitAt, "lastEffectiveAt refreshed (memory kept alive)");
+    assert(after.updatedAt === active.updatedAt, "markRecalled must not touch updatedAt");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

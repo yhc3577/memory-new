@@ -67,16 +67,35 @@ export type Freshness = "fresh" | "aging" | "stale" | "forgotten";
  *
  * halflife = BASE × (importance + 0.1)^1.5 × kindMultiplier
  * freshness is a pure function of age and halflife
+ *
+ * Co-Engram effectiveAge prefers lastEffectiveAt, falls back to createdAt, and
+ * treats an invalid/missing age as a brand-new memory ("fresh"). Callers that
+ * persist decay state pass createdAt so an L1 row lacking lastEffectiveAt is
+ * judged from its creation time instead of being pinned fresh forever.
  */
+export interface DeriveFreshnessOptions {
+  now?: number;
+  createdAt?: number;
+}
+
 export function deriveFreshness(
   lastEffectiveAt: number,
   importance: number,
   kind: string,
-  config: DecayConfig
+  config: DecayConfig,
+  opts?: DeriveFreshnessOptions
 ): Freshness {
   if (!config.importance.enabled) return "fresh";
 
-  const ageMs = Date.now() - lastEffectiveAt;
+  const now = opts?.now ?? Date.now();
+  let ageRef = lastEffectiveAt;
+  if (!isFinite(ageRef) || ageRef <= 0) {
+    ageRef = opts?.createdAt ?? NaN;
+    // No usable reference point → treat as a brand-new memory
+    if (!isFinite(ageRef) || ageRef <= 0) return "fresh";
+  }
+
+  const ageMs = now - ageRef;
   const ageDays = ageMs / (1000 * 60 * 60 * 24);
 
   const kindMultiplier = config.importance.kindMultipliers[kind] ?? 1.0;
@@ -123,6 +142,13 @@ export const LTP_GAIN = 0.1;
  * FAILURE_LOSS = 0.1 per failure event
  */
 export const FAILURE_LOSS = 0.1;
+
+/**
+ * Importance threshold below which a stale (but not forgotten) engram is
+ * forgotten instead of frozen. Mirrors Co-Engram dreaming/decay: stale AND
+ * importance < 0.2 → forget; stale AND importance ≥ 0.2 → freeze (archive).
+ */
+export const FORGET_IMPORTANCE_THRESHOLD = 0.2;
 
 /**
  * Apply LTP reinforcement to an engram
@@ -224,17 +250,22 @@ export function applyGraphDecay(
 /**
  * Decay batch processor (Deep Dreaming stage from Co-Engram research)
  *
- * Process rules:
- * - freshness=forgotten → forget
- * - freshness=stale && importance < 0.2 → archive (frozen)
- * - freshness=stale && importance ≥ 0.2 → no-op
+ * Co-Engram process rules (dreaming/decay.ts):
+ * - ONLY status=active is processed. draft/frozen/forgotten are skipped —
+ *   frozen is fully frozen (no auto-revive, no auto-forget), forgotten is terminal.
+ * - freshness=forgotten (age > 4× halflife) → forget, regardless of importance
+ * - freshness=stale && importance < 0.2 → forget
+ * - freshness=stale && importance ≥ 0.2 → freeze (archive)
  * - freshness=aging/fresh → no-op
+ *
+ * Mutates engrams in place for the IDs it flips.
  */
 export interface DecayBatchResult {
   forgotten: string[];    // IDs set to forgotten
   frozen: string[];        // IDs set to frozen
-  revived: string[];      // IDs revived from frozen
+  revived: string[];      // Kept for API shape; Co-Engram never auto-revives frozen
   total: number;
+  scanned: number;        // active records actually evaluated
 }
 
 export function applyDecayBatch(
@@ -246,13 +277,18 @@ export function applyDecayBatch(
     frozen: [],
     revived: [],
     total: engrams.length,
+    scanned: 0,
   };
 
-  for (const engram of engrams) {
-    // Skip already forgotten
-    if (engram.status === "forgotten") continue;
+  if (!config.stateMachine.enabled) {
+    return result;
+  }
 
-    if (!config.stateMachine.enabled) continue;
+  for (const engram of engrams) {
+    // Only active memories decay. Frozen stays frozen until recalled/revived by
+    // the host; forgotten is terminal; draft is not yet consolidated.
+    if (engram.status !== "active") continue;
+    result.scanned++;
 
     const freshness = deriveFreshness(
       engram.lastEffectiveAt,
@@ -275,7 +311,17 @@ export function applyDecayBatch(
         break;
 
       case "stale":
-        if (engram.importance < 0.2) {
+        if (engram.importance < FORGET_IMPORTANCE_THRESHOLD) {
+          decayLogger.log({
+            engramId: engram.id,
+            from: engram.status,
+            to: "forgotten",
+            reason: "importance",
+            metadata: { freshness, importance: engram.importance },
+          });
+          engram.status = "forgotten";
+          result.forgotten.push(engram.id);
+        } else {
           decayLogger.log({
             engramId: engram.id,
             from: engram.status,
@@ -290,18 +336,8 @@ export function applyDecayBatch(
 
       case "aging":
       case "fresh":
-        // Check if reviving from frozen
-        if (engram.status === "frozen") {
-          decayLogger.log({
-            engramId: engram.id,
-            from: "frozen",
-            to: "active",
-            reason: "reinforcement",
-            metadata: { freshness },
-          });
-          engram.status = "active";
-          result.revived.push(engram.id);
-        }
+        // No-op. Co-Engram never auto-revives frozen — revival only happens via
+        // an explicit host/recall event.
         break;
     }
   }
@@ -372,17 +408,21 @@ export async function applyTTLCleanup(
     const wouldRemain = currentCount - wouldDelete;
 
     if (wouldRemain < minRetain) {
-      // Don't delete all - keep at least minRetain
+      // Don't delete all - keep at least minRetain. Forget the OLDEST stale
+      // candidates so the newest (most recently effective) survive.
       const canDelete = currentCount - minRetain;
+      const byOldest = [...items].sort((a, b) => a.lastEffectiveAt - b.lastEffectiveAt);
       for (let i = 0; i < canDelete; i++) {
+        const target = byOldest[i];
+        if (!target) break;
         decayLogger.log({
-          engramId: items[i].id,
-          from: items[i].status,
+          engramId: target.id,
+          from: target.status,
           to: "forgotten",
           reason: "ttl",
-          metadata: { age: (Date.now() - items[i].lastEffectiveAt) / (1000 * 60 * 60 * 24) },
+          metadata: { age: (Date.now() - target.lastEffectiveAt) / (1000 * 60 * 60 * 24) },
         });
-        items[i].status = "forgotten";
+        target.status = "forgotten";
         result.deleted++;
       }
       result.skipped += wouldDelete - canDelete;

@@ -32,6 +32,11 @@ export interface L0Message {
   recordedAt: string;      // ISO timestamp
 }
 
+/** Decay status persisted on an L1 row (mirrors EngramStatus in ../index). */
+export type L1MemoryStatus = "draft" | "active" | "frozen" | "forgotten";
+/** Kind persisted on an L1 row (mirrors EngramKind in ../index). */
+export type L1MemoryKind = "observation" | "fact" | "pattern" | "procedure" | "hypothesis";
+
 export interface L1Record {
   id: string;
   content: string;
@@ -49,8 +54,25 @@ export interface L1Record {
   teamId?: string;
   userId: string;
   agentId: string;
+  // Decay state (Co-Engram semantics). All optional for backward compat with
+  // rows written before decay was persisted. Backfill defaults at read/derive
+  // time: status=active, importance=priority/100, kind from type,
+  // lastEffectiveAt=createdAt epoch.
+  status?: L1MemoryStatus;
+  kind?: L1MemoryKind;
+  importance?: number;      // 0-1
+  lastEffectiveAt?: number; // epoch ms; drives freshness
+  retrievalCount?: number;  // successful recall hits
+  lastRetrievedAt?: number; // epoch ms of most recent recall hit
   // Vector embedding stored separately
 }
+
+/**
+ * Minimum gap (ms) between two recall-hit refreshes of the same L1 row.
+ * Repeated hits inside the window are dropped so per-turn recall across
+ * before_prompt_build / mem search / mem_new_search doesn't inflate counts.
+ */
+export const L1_RECALL_DEBOUNCE_MS = 60_000;
 
 export interface L2Scene {
   id: string;
@@ -245,6 +267,191 @@ export class StorageAdapter {
     allRecords.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     return allRecords.slice(0, limit);
+  }
+
+  /**
+   * L1: Read ALL records across every session JSONL file — no cap, no sort,
+   * malformed lines skipped. Used by decay runs which need the full population
+   * (recall/search keep their own bounded, sorted views).
+   */
+  async readAllL1(): Promise<L1Record[]> {
+    const l1Dir = this.resolve(STORAGE_PATHS.l1);
+    if (!existsSync(l1Dir)) return [];
+
+    const all: L1Record[] = [];
+    const files = readdirSync(l1Dir).filter(f => f.endsWith(".jsonl"));
+    for (const file of files) {
+      const fileSessionKey = file.replace(/\.jsonl$/, "");
+      let content: string | null = null;
+      try {
+        content = readFileSync(join(l1Dir, file), "utf-8");
+      } catch {
+        continue;
+      }
+      if (!content) continue;
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const rec = JSON.parse(line) as L1Record;
+          if (rec && typeof rec.id === "string") {
+            if (!rec.sessionKey) rec.sessionKey = fileSessionKey;
+            all.push(rec);
+          }
+        } catch {
+          // Skip malformed lines
+        }
+      }
+    }
+    return all;
+  }
+
+  /**
+   * L1: Apply per-record field patches and persist them durably.
+   *
+   * Each touched session file is rewritten SYNCHRONOUSLY in a single tick
+   * (readFileSync → mutate matching lines by id → writeFileSync). This avoids
+   * interleaving with concurrent appendL1 appends, which would otherwise lose
+   * rows on an async read-modify-write with an await in between.
+   *
+   * Malformed lines are preserved verbatim; lines whose id does not match any
+   * patch are returned unchanged. Absent/empty files are skipped. The patch is
+   * intentionally a field-level set — callers decide what it mutates (e.g. only
+   * { status } for decay flips, so updatedAt keeps meaning "content changed").
+   */
+  async persistL1Patches(
+    patches: Array<{ sessionKey: string; id: string; patch: Partial<L1Record> }>
+  ): Promise<number> {
+    if (patches.length === 0) return 0;
+
+    // Group by sessionKey and merge patches hitting the same id
+    const grouped = new Map<string, Map<string, Partial<L1Record>>>();
+    for (const p of patches) {
+      if (!p.sessionKey || !p.id) continue;
+      let byId = grouped.get(p.sessionKey);
+      if (!byId) {
+        byId = new Map();
+        grouped.set(p.sessionKey, byId);
+      }
+      byId.set(p.id, { ...(byId.get(p.id) ?? {}), ...p.patch });
+    }
+
+    let applied = 0;
+    for (const [sessionKey, byId] of grouped) {
+      const filePath = this.resolve(`${STORAGE_PATHS.l1}${sessionKey}.jsonl`);
+      if (!existsSync(filePath)) continue;
+      let content: string;
+      try {
+        content = readFileSync(filePath, "utf-8");
+      } catch {
+        continue;
+      }
+      const lines = content.split("\n");
+      let changed = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        let rec: L1Record | null = null;
+        try {
+          rec = JSON.parse(line) as L1Record;
+        } catch {
+          continue; // malformed → keep verbatim
+        }
+        if (!rec || typeof rec.id !== "string") continue;
+        const patch = byId.get(rec.id);
+        if (!patch) continue;
+        Object.assign(rec, patch);
+        lines[i] = JSON.stringify(rec);
+        byId.delete(rec.id);
+        changed = true;
+        applied++;
+      }
+      if (changed) {
+        try {
+          writeFileSync(filePath, lines.join("\n"), "utf-8");
+        } catch {
+          // leave as-is; a later decay run can retry
+        }
+      }
+    }
+    return applied;
+  }
+
+  /**
+   * L1: Record a successful recall hit.
+   *
+   * Bumps retrievalCount and refreshes lastEffectiveAt/lastRetrievedAt — this
+   * is what keeps a recalled memory "alive" (Co-Engram LTP is event-driven;
+   * recall events are the reinforcement signal). Only status=active rows are
+   * bumped; frozen/forgotten are skipped so recall can never resurrect a
+   * memory behind the host's back. Debounced per row by `debounceMs` based on
+   * the persisted lastRetrievedAt, so repeated hits in a short window don't
+   * hammer the disk / inflate counts.
+   */
+  async bumpL1Recalled(
+    hits: Array<{ sessionKey: string; id: string }>,
+    debounceMs: number = L1_RECALL_DEBOUNCE_MS
+  ): Promise<number> {
+    if (hits.length === 0) return 0;
+
+    const grouped = new Map<string, Set<string>>();
+    for (const h of hits) {
+      if (!h.sessionKey || !h.id) continue;
+      if (!grouped.has(h.sessionKey)) grouped.set(h.sessionKey, new Set());
+      grouped.get(h.sessionKey)!.add(h.id);
+    }
+
+    const now = Date.now();
+    let applied = 0;
+    for (const [sessionKey, ids] of grouped) {
+      const filePath = this.resolve(`${STORAGE_PATHS.l1}${sessionKey}.jsonl`);
+      if (!existsSync(filePath)) continue;
+      let content: string;
+      try {
+        content = readFileSync(filePath, "utf-8");
+      } catch {
+        continue;
+      }
+      const lines = content.split("\n");
+      let changed = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        let rec: L1Record | null = null;
+        try {
+          rec = JSON.parse(line) as L1Record;
+        } catch {
+          continue;
+        }
+        if (!rec || typeof rec.id !== "string" || !ids.has(rec.id)) continue;
+        if ((rec.status ?? "active") !== "active") {
+          ids.delete(rec.id); // never resurrect frozen/forgotten
+          continue;
+        }
+        const lastRetrieved = rec.lastRetrievedAt ?? 0;
+        if (now - lastRetrieved < debounceMs) {
+          ids.delete(rec.id);
+          continue;
+        }
+        const bumped: L1Record = {
+          ...rec,
+          retrievalCount: (rec.retrievalCount ?? 0) + 1,
+          lastEffectiveAt: now,
+          lastRetrievedAt: now,
+        };
+        lines[i] = JSON.stringify(bumped);
+        ids.delete(rec.id);
+        changed = true;
+        applied++;
+      }
+      if (changed) {
+        try {
+          writeFileSync(filePath, lines.join("\n"), "utf-8");
+        } catch {
+          // leave as-is; a later recall can retry
+        }
+      }
+    }
+    return applied;
   }
 
   // ========== L2 Operations (Markdown files) ==========
@@ -510,12 +717,29 @@ export interface RecallResult {
   prependContext?: string;
   /** Stable recall context appended to system prompt (L2/L3, cacheable) */
   appendSystemContext?: string;
-  /** L1 memories with scores (for metrics) */
-  recalledL1Memories?: Array<{ content: string; score: number; type: string }>;
+  /** L1 memories with scores + id/sessionKey (so hits can be reinforced) */
+  recalledL1Memories?: Array<{
+    content: string;
+    score: number;
+    type: string;
+    id: string;
+    sessionKey: string;
+  }>;
   /** L3 persona raw content */
   recalledL3Persona?: string | null;
   /** Search strategy used */
   recallStrategy?: string;
+}
+
+/**
+ * Whether an L1 row may be surfaced in recall. Status defaults to "active" for
+ * rows written before decay persistence; only frozen/forgotten are excluded —
+ * the same default the Co-Engram retrieval filter applies (archived/forgotten
+ * are not returned unless explicitly requested).
+ */
+export function isL1Recallable(r: Pick<L1Record, "status">): boolean {
+  const status = r.status ?? "active";
+  return status !== "frozen" && status !== "forgotten";
 }
 
 const RECALL_LINE_SEPARATOR = "\n";
@@ -594,8 +818,9 @@ export class RecallEngine {
 
     // 1. Search L1 memories - use hybrid or text search
     if (vectorStore) {
-      // First, sync all L1 records to vector store for BM25 search
-      const allL1Records = await this.storage.searchL1("", 1000);
+      // First, sync recallable L1 records to the vector store for BM25 search.
+      // frozen/forgotten are never indexed so hybrid recall can't resurrect them.
+      const allL1Records = (await this.storage.searchL1("", 1000)).filter(isL1Recallable);
       vectorStore.syncFromL1Records(allL1Records.map(r => ({
         id: r.id,
         content: r.content,
@@ -627,6 +852,9 @@ export class RecallEngine {
       memories = await this.storage.searchL1(query, topK);
       recallStrategy = "text";
     }
+
+    // 1b. Recallability filter — memories from any strategy must be active-ish.
+    memories = memories.filter(isL1Recallable);
 
     // 2. Read L2 scene navigation
     const sceneIndex = await this.storage.readSceneIndex();
@@ -677,6 +905,8 @@ ${generateSceneNavigation(sceneIndex)}
         content: m.content,
         score: 0.5, // TODO: calculate real score
         type: m.type,
+        id: m.id,
+        sessionKey: m.sessionKey,
       })),
       recalledL3Persona: persona?.content ?? null,
       recallStrategy,
@@ -764,6 +994,29 @@ export class MemoryStore {
 
   async searchL1(query: string, limit: number = 10): Promise<L1Record[]> {
     return this.storage.searchL1(query, limit);
+  }
+
+  /** L1 rows across ALL sessions (uncapped) — the decay run's population. */
+  async listAllL1(): Promise<L1Record[]> {
+    return this.storage.readAllL1();
+  }
+
+  /** Persist per-row field patches (used by decay runs to flip status). */
+  async applyDecayStatus(
+    updates: Array<{ sessionKey: string; id: string; patch: Partial<L1Record> }>
+  ): Promise<number> {
+    return this.storage.persistL1Patches(updates);
+  }
+
+  /**
+   * Reinforce successfully recalled L1 rows (bump count + refresh effective
+   * time). Active-only; debounced by L1_RECALL_DEBOUNCE_MS unless overridden.
+   */
+  async markRecalled(
+    hits: Array<{ sessionKey: string; id: string }>,
+    debounceMs: number = L1_RECALL_DEBOUNCE_MS
+  ): Promise<number> {
+    return this.storage.bumpL1Recalled(hits, debounceMs);
   }
 
   // ========== L2 Operations ==========
