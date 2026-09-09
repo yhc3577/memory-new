@@ -14,7 +14,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { VectorStore, MemoryStore, StorageAdapter, DistillationPipeline, DEFAULT_DISTILLATION_CONFIG, TeamMemoryManager, TeamEventStore, applyDecayBatch, applyTTLCleanup, applyDecayToL1, toDecayConfig, deriveFreshness, deriveHotness, decayLogger, StateTransitionLogger, startVisualizeServer, RecallEngine, runVisualizeSetup, isL1Recallable } = testing;
+const { VectorStore, MemoryStore, StorageAdapter, DistillationPipeline, DEFAULT_DISTILLATION_CONFIG, TeamMemoryManager, TeamEventStore, applyDecayBatch, applyTTLCleanup, applyDecayToL1, toDecayConfig, deriveFreshness, deriveHotness, decayLogger, StateTransitionLogger, startVisualizeServer, RecallEngine, runVisualizeSetup, isL1Recallable, TeamPersistence, resolveLocalAgentId, resolveLocalUserId, sanitizeAgentId } = testing;
 
 // Test utilities
 const tests = [];
@@ -643,7 +643,7 @@ test("Decay: recall excludes frozen/forgotten and exposes id+sessionKey", async 
     await seedL1(dir, forgotten);
 
     const engine = new RecallEngine(new StorageAdapter(dir));
-    const result = await engine.recall({ query: "蓝色主题", sessionKey: "r-session", userId: "u", agentId: "a", topK: 10 });
+    const result = await engine.recall({ query: "蓝色主题", sessionKey: "r-session", userId: "u", agentId: "a", topK: 10, filterByScope: false });
     const mems = result.recalledL1Memories ?? [];
     const ids = mems.map(m => m.id);
     assert(ids.includes("act"), "active memory should be recalled");
@@ -1013,6 +1013,218 @@ test("Visualize setup: patches openclaw.json under config.visualize", async () =
     process.env.HOME = originalHome;
     process.env.OPENCLAW_PROFILE = originalProfile;
     rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Test: TeamPersistence (Persistent Agent Relations)
+// ============================================================================
+
+test("Team Persistence: roundtrip share + import", async () => {
+  const dir = uniqueStoreDir("tp-roundtrip-");
+  try {
+    const tp = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    const initial = tp.readRelation("main");
+    assert(initial.sharedToTeam === false, "default sharedToTeam should be false");
+    assert(initial.importedAgentIds.length === 0, "default importedAgentIds should be empty");
+
+    // Share self
+    const s1 = tp.setSharedToTeam("main", true, "main");
+    assert(s1.ok, `share self should succeed: ${s1.error}`);
+
+    // Import another agent
+    const i1 = tp.importAgent("secondary", "main");
+    assert(i1.ok, `import main should succeed: ${i1.error}`);
+    assert(tp.listImportedAgentIds("secondary").includes("main"), "secondary should see main imported");
+
+    // Read back — drop in-memory cache to force disk read
+    const tp2 = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    const mainRel = tp2.readRelation("main");
+    assert(mainRel.sharedToTeam === true, "main.sharedToTeam should persist true");
+    const secRel = tp2.readRelation("secondary");
+    assert(secRel.importedAgentIds.includes("main"), "secondary.importedAgentIds should persist [main]");
+
+    // listSharedAgents includes main
+    const shared = await tp2.listSharedAgents();
+    assert(shared.includes("main"), `sharedAgents should include main, got ${JSON.stringify(shared)}`);
+    assert(!shared.includes("secondary"), "sharedAgents must NOT include non-shared agent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Team Persistence: share gate rejects non-owner actor", async () => {
+  const dir = uniqueStoreDir("tp-share-gate-");
+  try {
+    const tp = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    const r = tp.setSharedToTeam("main", true, "secondary");
+    assert(!r.ok, "share must reject when actor !== target");
+    assert(/only the agent itself/i.test(r.error || ""), `error should explain self-only rule, got: ${r.error}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Team Persistence: import cap enforces maxImportedAgents", async () => {
+  const dir = uniqueStoreDir("tp-cap-");
+  try {
+    const tp = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    assert(tp.importAgent("a", "b").ok, "first import should succeed");
+    assert(tp.importAgent("a", "c").ok, "second import should succeed");
+    const r = tp.importAgent("a", "d");
+    assert(!r.ok, "third import must fail under cap=2");
+    assert(/limit/i.test(r.error || ""), `error should mention limit, got: ${r.error}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Team Persistence: import self is forbidden", async () => {
+  const dir = uniqueStoreDir("tp-self-");
+  try {
+    const tp = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    const r = tp.importAgent("main", "main");
+    assert(!r.ok, "self-import must be forbidden");
+    assert(/own agent/i.test(r.error || ""), `error should explain self-import rule, got: ${r.error}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recall: isolation — self only when filterByScope and no imports", async () => {
+  const dir = uniqueStoreDir("recall-iso-");
+  try {
+    const a = makeL1Seed({ id: "row-a", content: "main 持有 关键词", sessionKey: "iso", agentId: "main" });
+    const b = makeL1Seed({ id: "row-b", content: "secondary 持有 关键词", sessionKey: "iso", agentId: "secondary" });
+    await seedL1(dir, a);
+    await seedL1(dir, b);
+
+    const engine = new RecallEngine(new StorageAdapter(dir));
+    const result = await engine.recall({
+      query: "关键词",
+      sessionKey: "iso",
+      userId: "u",
+      agentId: "main",
+      topK: 10,
+      importedAgentIds: [],
+      filterByScope: true,
+    });
+    const ids = (result.recalledL1Memories ?? []).map((m) => m.id);
+    assert(ids.includes("row-a"), "self row should be recalled");
+    assert(!ids.includes("row-b"), "other-agent row must be hidden without import");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recall: with import — borrowed rows appear, tagged fromAgentId", async () => {
+  const dir = uniqueStoreDir("recall-import-");
+  try {
+    const a = makeL1Seed({ id: "row-a", content: "main 持有 关键词", sessionKey: "iso", agentId: "main" });
+    const b = makeL1Seed({ id: "row-b", content: "secondary 持有 关键词", sessionKey: "iso", agentId: "secondary" });
+    await seedL1(dir, a);
+    await seedL1(dir, b);
+
+    const engine = new RecallEngine(new StorageAdapter(dir));
+    const result = await engine.recall({
+      query: "关键词",
+      sessionKey: "iso",
+      userId: "u",
+      agentId: "main",
+      topK: 10,
+      importedAgentIds: ["secondary"],
+      filterByScope: true,
+    });
+    const mems = result.recalledL1Memories ?? [];
+    const ids = mems.map((m) => m.id);
+    assert(ids.includes("row-a"), "self row visible");
+    assert(ids.includes("row-b"), "imported row visible");
+    // fromAgentId tagging is the plugin's responsibility (callers stamp it);
+    // here we only assert scope filter passed — borrowed id present.
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recall: shared-but-not-imported is hidden (TDB two-step)", async () => {
+  const dir = uniqueStoreDir("recall-shared-");
+  try {
+    // secondary flipped sharedToTeam=true but main never imported secondary.
+    // TDB rule: share alone doesn't expand reader's recall — bind is required.
+    const a = makeL1Seed({ id: "row-a", content: "main 持有 关键词", sessionKey: "iso", agentId: "main" });
+    const b = makeL1Seed({ id: "row-b", content: "secondary 持有 关键词", sessionKey: "iso", agentId: "secondary" });
+    await seedL1(dir, a);
+    await seedL1(dir, b);
+
+    const tp = new TeamPersistence({ dataDir: dir, teamId: "t1", maxImportedAgents: 2 });
+    tp.setSharedToTeam("secondary", true, "secondary"); // secondary is shared
+    // Note: main does NOT import secondary.
+
+    const engine = new RecallEngine(new StorageAdapter(dir));
+    const result = await engine.recall({
+      query: "关键词",
+      sessionKey: "iso",
+      userId: "u",
+      agentId: "main",
+      topK: 10,
+      importedAgentIds: tp.listImportedAgentIds("main"),
+      filterByScope: true,
+    });
+    const ids = (result.recalledL1Memories ?? []).map((m) => m.id);
+    assert(ids.includes("row-a"), "self row visible");
+    assert(!ids.includes("row-b"), "shared-but-not-imported row must be hidden");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Identity: legacy fallback returns 'self' when ctx is empty", () => {
+  assert(resolveLocalAgentId(undefined) === "self", "undefined ctx → 'self'");
+  assert(resolveLocalAgentId(null) === "self", "null ctx → 'self'");
+  assert(resolveLocalAgentId({}) === "self", "empty ctx → 'self'");
+  assert(resolveLocalAgentId({ agentId: "main" }) === "main", "ctx.agentId wins");
+  assert(resolveLocalAgentId({ sessionKey: "agent:main:main" }) === "main", "sessionKey parsed when agentId missing");
+  assert(resolveLocalUserId({ userId: "owner" }) === "owner", "userId wins");
+  assert(resolveLocalUserId({}) === "user", "empty → 'user'");
+  assert(sanitizeAgentId("main/secondary:1") === "main_secondary_1", "non-safe chars → underscore");
+});
+
+test("Decay: imported row still undergoes decay (frozen/forgotten)", async () => {
+  const dir = uniqueStoreDir("decay-imported-");
+  try {
+    // Seed an imported-eligible row: belongs to "secondary", old enough to be
+    // forgotten under Co-Engram rules (age >> 4× halflife).
+    const veryOld = Date.now() - 1000 * 24 * 60 * 60 * 1000; // 1000 days ago
+    const r = makeL1Seed({
+      id: "imported-old",
+      content: "导入行 极旧",
+      sessionKey: "iso",
+      agentId: "secondary",
+      lastEffectiveAt: veryOld,
+      importance: 0.1,
+      status: "active",
+      kind: "fact",
+    });
+    await seedL1(dir, r);
+
+    const store = new MemoryStore(dir);
+    const all = await store.listAllL1();
+    const decayConfig = {
+      stateMachine: { enabled: true },
+      importance: { enabled: true, baseHalflifeDays: 50, kindMultipliers: { fact: 1.0 } },
+    };
+    const batchResult = applyDecayBatch(all, decayConfig, { now: Date.now() });
+    const rowById = new Map(all.map((r) => [r.id, r]));
+    const updates = batchResult.forgotten
+      .map((id) => ({ sessionKey: rowById.get(id)?.sessionKey ?? "iso", id, patch: { status: "forgotten" } }))
+      .concat(batchResult.frozen.map((id) => ({ sessionKey: rowById.get(id)?.sessionKey ?? "iso", id, patch: { status: "frozen" } })));
+    await store.applyDecayStatus(updates);
+
+    const after = (await store.listAllL1()).find((x) => x.id === "imported-old");
+    assert(after, "row should still exist after decay");
+    assert(after.status !== "active", `imported row should leave active; got ${after.status}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

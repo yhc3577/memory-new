@@ -62,6 +62,21 @@ export interface VisualizeServerOptions {
   dataDir: string;
   /** Storage backend actually in use (after fallback). */
   backend: "memory" | "sqlite";
+  /** Optional team-memory read-only surface. When absent, /api/team-status returns 503. */
+  team?: {
+    /** Read the relation file for one agent. */
+    readRelation: (agentId: string) => {
+      sharedToTeam: boolean;
+      importedAgentIds: string[];
+      updatedAt: number;
+    };
+    /** Every agent with sharedToTeam=true. */
+    listSharedAgents: () => Promise<string[]>;
+    /** Every agent the actor could import (excluding self). */
+    listImportableAgentIds: (actor: string) => Promise<string[]>;
+  };
+  /** Optional override for currentAgent on the dashboard (defaults to env MEMORY_NEW_AGENT_ID or "self"). */
+  currentAgentId?: string;
 }
 
 export interface VisualizeServerHandle {
@@ -208,6 +223,7 @@ async function handle(
         userId: "__viz__",
         agentId: "__viz__",
         topK: 10,
+        filterByScope: false, // visualize dashboard probes the global recall view
       });
       return json(res, 200, {
         strategy: result.recallStrategy,
@@ -224,6 +240,24 @@ async function handle(
     }
     case "/api/l3-preview":
       return json(res, 200, await opts.l3DryRun());
+    case "/api/team-status": {
+      if (!opts.team) {
+        return json(res, 503, { error: "team surface not configured" });
+      }
+      const currentAgent = opts.currentAgentId ?? process.env.MEMORY_NEW_AGENT_ID ?? "self";
+      const rel = opts.team.readRelation(currentAgent);
+      const sharedAgents = await opts.team.listSharedAgents();
+      const candidates = await opts.team.listImportableAgentIds(currentAgent);
+      return json(res, 200, {
+        currentAgent,
+        sharedToTeam: rel.sharedToTeam,
+        importedAgents: rel.importedAgentIds,
+        sharedAgents,
+        candidates,
+        dataDir: opts.dataDir,
+        updatedAt: rel.updatedAt,
+      });
+    }
     case "/api/scene-graph":
       return json(res, 200, await sceneGraph(opts));
     default:

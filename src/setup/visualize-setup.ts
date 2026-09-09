@@ -37,7 +37,7 @@ function readJson<T = unknown>(path: string): T {
   return JSON.parse(readFileSync(path, "utf-8")) as T;
 }
 
-function writeJsonAtomic(path: string, obj: unknown): void {
+export function writeJsonAtomic(path: string, obj: unknown): void {
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", "utf-8");
   renameSync(tmp, path);

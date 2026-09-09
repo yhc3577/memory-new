@@ -810,8 +810,17 @@ export class RecallEngine {
     agentId: string;
     topK?: number;
     vectorStore?: import("../vector/vector-store.js").VectorStore;
+    /** Reader's imported agent ids (max 2). Used by filterByScope. */
+    importedAgentIds?: string[];
+    /** Tighten visibility to self ∪ imported (default true). Set false to fall back to legacy global recall. */
+    filterByScope?: boolean;
   }): Promise<RecallResult> {
     const { query, sessionKey, topK = 10, vectorStore } = params;
+    const importedAgentIds = params.importedAgentIds ?? [];
+    const filterByScope = params.filterByScope !== false; // default true
+    const allowedAgents = new Set<string>(
+      filterByScope ? [params.agentId, ...importedAgentIds] : [],
+    );
 
     let memories: L1Record[] = [];
     let recallStrategy = "text";
@@ -820,11 +829,15 @@ export class RecallEngine {
     if (vectorStore) {
       // First, sync recallable L1 records to the vector store for BM25 search.
       // frozen/forgotten are never indexed so hybrid recall can't resurrect them.
-      const allL1Records = (await this.storage.searchL1("", 1000)).filter(isL1Recallable);
+      // When filterByScope is on, ONLY sync self+imported rows so hybrid search
+      // can never return a row the scope filter would drop anyway.
+      const allL1Records = (await this.storage.searchL1("", 1000))
+        .filter(isL1Recallable)
+        .filter((r) => !filterByScope || allowedAgents.has(r.agentId ?? "self"));
       vectorStore.syncFromL1Records(allL1Records.map(r => ({
         id: r.id,
         content: r.content,
-        metadata: { type: r.type, sceneName: r.sceneName },
+        metadata: { type: r.type, sceneName: r.sceneName, agentId: r.agentId },
       })));
 
       // Use hybrid search (BM25 + semantic + entity boost)
@@ -855,6 +868,13 @@ export class RecallEngine {
 
     // 1b. Recallability filter — memories from any strategy must be active-ish.
     memories = memories.filter(isL1Recallable);
+
+    // 1c. Team-scope filter — only rows whose agentId ∈ {self, imported}.
+    // Default on (filterByScope !== false). When off, every recallable row is
+    // visible (legacy escape hatch).
+    if (filterByScope) {
+      memories = memories.filter((m) => allowedAgents.has(m.agentId ?? "self"));
+    }
 
     // 2. Read L2 scene navigation
     const sceneIndex = await this.storage.readSceneIndex();
@@ -1061,7 +1081,15 @@ export class MemoryStore {
 
   // ========== Recall ==========
 
-  async recallMemories(query: string, sessionKey: string, userId: string, agentId: string, topK?: number): Promise<RecallResult> {
-    return this.recall.recall({ query, sessionKey, userId, agentId, topK });
+  async recallMemories(
+    query: string,
+    sessionKey: string,
+    userId: string,
+    agentId: string,
+    topK?: number,
+    importedAgentIds?: string[],
+    filterByScope?: boolean,
+  ): Promise<RecallResult> {
+    return this.recall.recall({ query, sessionKey, userId, agentId, topK, importedAgentIds, filterByScope });
   }
 }

@@ -19,6 +19,8 @@ import { VectorStore } from "./src/vector/vector-store.js";
 import type { EmbeddingProvider } from "openclaw/plugin-sdk/embedding-providers";
 import { applyDecayBatch, applyTTLCleanup, DEFAULT_DECAY_CONFIG, FORGET_IMPORTANCE_THRESHOLD, type DecayConfig } from "./src/decay/decay.js";
 import { TeamMemoryManager, TeamEventStore } from "./src/team/team-memory.js";
+import { TeamPersistence } from "./src/team/team-persistence.js";
+import { resolveLocalAgentId, resolveLocalUserId, sanitizeAgentId } from "./src/team/team-identity.js";
 
 // ============================================================================
 // Types & Interfaces
@@ -129,6 +131,10 @@ export interface MemoryNewConfig {
     enabled: boolean;
     maxImportedAgents: number;
     visibilityGate: boolean;
+    /** Tighten recall to self ∪ imported (default true). false = legacy global visibility. */
+    filterByScope?: boolean;
+    /** Single-team v1: all agents in this gateway share one teamId. */
+    teamId?: string;
   };
 
   // Retrieval
@@ -199,6 +205,8 @@ const DEFAULT_CONFIG: MemoryNewConfig = {
     enabled: true,
     maxImportedAgents: 2,
     visibilityGate: true,
+    filterByScope: true,
+    teamId: "default-team",
   },
   retrieval: {
     hybridSearch: true,
@@ -515,6 +523,11 @@ export default definePluginEntry({
         l3DryRun,
         dataDir: storageConfig.dataDir,
         backend: effectiveBackend,
+        team: {
+          readRelation: (id) => teamPersistence.readRelation(id),
+          listSharedAgents: () => teamPersistence.listSharedAgents(),
+          listImportableAgentIds: (id) => teamPersistence.listImportableAgentIds(id),
+        },
       });
       visualizeServer = handle;
       api.logger.info?.(`[memory_new] visualize server listening at ${handle.url}`);
@@ -577,8 +590,23 @@ export default definePluginEntry({
       }
     }
 
-    // Initialize team memory manager
+    // Initialize team memory: persistent share/import state + writer-sharded event log.
+    // The TeamMemoryManager is kept (still used by other surfaces) but the source of
+    // truth for share/import now lives in TeamPersistence (files under
+    // <dataDir>/team/agents/<agentId>.json).
     const teamMemory = new TeamMemoryManager(config.teamMemory.maxImportedAgents);
+    const teamEventStore = new TeamEventStore(
+      `${storageConfig.dataDir.replace("~", process.env.HOME || "/root")}`,
+    );
+    const teamPersistence = new TeamPersistence(
+      {
+        dataDir: storageConfig.dataDir,
+        teamId: config.teamMemory.teamId ?? "default-team",
+        maxImportedAgents: config.teamMemory.maxImportedAgents,
+        logger: { warn: (m) => api.logger.warn?.(m), info: (m) => api.logger.info?.(m) },
+      },
+      teamEventStore,
+    );
 
     // Wire up vector store to memory store
     store.setVectorStore(vectorStore);
@@ -767,8 +795,8 @@ export default definePluginEntry({
               timestamps: [now],
               sessionKey: ctx.sessionKey ?? "default",
               sessionId: ctx.sessionKey ?? "default",
-              userId: ctx.senderIsOwner ? "owner" : "user",
-              agentId: "self",
+              userId: resolveLocalUserId(ctx),
+              agentId: resolveLocalAgentId(ctx),
             });
 
             return { text: `Added: ${content.slice(0, 50)}...` };
@@ -778,13 +806,18 @@ export default definePluginEntry({
             const query = rest.join(" ");
             if (!query) return { text: "Usage: memory search <query>" };
 
+            const localAgent = resolveLocalAgentId(ctx);
+            const localUser = resolveLocalUserId(ctx);
+            const imported = teamPersistence.readRelation(localAgent).importedAgentIds;
             // Use recall engine for search
             const result = await recall.recall({
               query,
               sessionKey: ctx.sessionKey ?? "default",
-              userId: ctx.senderIsOwner ? "owner" : "user",
-              agentId: "self",
+              userId: localUser,
+              agentId: localAgent,
               topK: config.retrieval.topK,
+              importedAgentIds: imported,
+              filterByScope: config.teamMemory.filterByScope !== false,
             });
 
             reinforceRecalled(result);
@@ -866,10 +899,10 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
       },
     });
 
-    // Team memory command
+    // Team memory command — persistent share/import via TeamPersistence.
     api.registerCommand({
       name: "team-mem",
-      description: "Team memory operations",
+      description: "Team memory operations (share / import / unimport / status)",
       acceptsArgs: true,
       exposeSenderIsOwner: true,
       handler: async (ctx) => {
@@ -877,35 +910,62 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
           return { text: "Team memory is disabled." };
         }
 
-        const args = ctx.args ?? "";
-        const [action, ...rest] = args.trim().split(/\s+/);
+        const actor = resolveLocalAgentId(ctx);
+        const args = (ctx.args ?? "").trim();
+        const [action, ...rest] = args.split(/\s+/);
+
+        const helpText = `Team memory commands (you are: ${actor}):
+  team-mem share                       - Share your agent's whole L1 with the team
+  team-mem unshare                     - Stop sharing your agent's L1
+  team-mem import <fromAgentId>        - Bind another agent's shared L1 into your recall (≤${config.teamMemory.maxImportedAgents})
+  team-mem unimport <fromAgentId>      - Drop a binding
+  team-mem status                      - Show your relations + candidates
+`;
 
         switch (action) {
           case "share": {
-            return { text: "Share is not yet implemented." };
+            const r = teamPersistence.setSharedToTeam(actor, true, actor);
+            if (!r.ok) return { text: `share failed: ${r.error}` };
+            return { text: `✓ shared — your L1 is now visible to teammates who import you.\n(data: ${storageConfig.dataDir}/team/agents/${actor}.json)` };
           }
-
+          case "unshare": {
+            const r = teamPersistence.setSharedToTeam(actor, false, actor);
+            if (!r.ok) return { text: `unshare failed: ${r.error}` };
+            return { text: "✓ unshared — your L1 is private again." };
+          }
           case "import": {
-            return { text: "Import is not yet implemented." };
+            const fromAgentId = rest[0];
+            if (!fromAgentId) return { text: "Usage: team-mem import <fromAgentId>" };
+            const r = teamPersistence.importAgent(actor, fromAgentId);
+            if (!r.ok) return { text: `import failed: ${r.error}` };
+            return { text: `✓ imported ${fromAgentId} — their shared L1 will appear in your recall.` };
           }
-
-          case "status": {
+          case "unimport": {
+            const fromAgentId = rest[0];
+            if (!fromAgentId) return { text: "Usage: team-mem unimport <fromAgentId>" };
+            const r = teamPersistence.unimportAgent(actor, fromAgentId);
+            if (!r.ok) return { text: `unimport failed: ${r.error}` };
+            return { text: `✓ dropped ${fromAgentId} from your imports.` };
+          }
+          case "status":
+          default: {
+            const rel = teamPersistence.readRelation(actor);
+            const candidates = await teamPersistence.listImportableAgentIds(actor);
+            const shared = await teamPersistence.listSharedAgents();
             const stats = await pipeline.getStats();
             return {
-              text: `Team memory status:
-  Enabled: ${config.teamMemory.enabled}
+              text: `Team memory status (you: ${actor}, team: ${config.teamMemory.teamId ?? "default-team"}):
+  Filter by scope: ${config.teamMemory.filterByScope !== false ? "on (self ∪ imported)" : "off (legacy global)"}
   Max imported agents: ${config.teamMemory.maxImportedAgents}
-  Visibility gate: ${config.teamMemory.visibilityGate}
-  Total L1 memories: ${stats.l1Count}
-  Total L2 scenes: ${stats.l2Count}`,
+  Your sharedToTeam: ${rel.sharedToTeam}
+  Your imported: [${rel.importedAgentIds.join(", ")}]
+  All shared agents: [${shared.join(", ")}]
+  Candidates to import (other agents on this gateway): [${candidates.join(", ")}]
+  Total L1: ${stats.l1Count}, L2: ${stats.l2Count}
+
+${helpText}`,
             };
           }
-
-          default:
-            return {
-              text: `Team memory commands:
-  team-memory status            - Show team memory status`,
-            };
         }
       },
     });
@@ -970,6 +1030,17 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
           lines.push(`  pipeline:                L0=${p.l0Count} L1=${p.l1Count} L2=${p.l2Count} L3=${p.l3Count}`);
         }
         if (report.layers.sideEffects.error) lines.push(`  error:   ${report.layers.sideEffects.error}`);
+        lines.push("");
+        lines.push("[multiAgentIsolation]");
+        if (report.layers.multiAgentIsolation) {
+          const m = report.layers.multiAgentIsolation;
+          lines.push(`  selfOnly:                ${m.selfOnlyOk ? "✓" : "✗"}`);
+          lines.push(`  imported:                ${m.importedOk ? "✓" : "✗"}`);
+          lines.push(`  sharedNotImportedHidden: ${m.sharedNotImportedHidden ? "✓" : "✗"}`);
+          if (m.error) lines.push(`  error:   ${m.error}`);
+        } else {
+          lines.push(`  (not run)`);
+        }
         lines.push("");
         lines.push("[coverage]");
         lines.push(`  checked: ${report.coverage.checked.length}`);
@@ -1088,6 +1159,13 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
           pipelineStats?: { l0Count: number; l1Count: number; l2Count: number; l3Count: number };
           error?: string;
         };
+        multiAgentIsolation?: {
+          passed: boolean;
+          selfOnlyOk: boolean;
+          importedOk: boolean;
+          sharedNotImportedHidden: boolean;
+          error?: string;
+        };
       };
       coverage: {
         checked: string[];
@@ -1132,6 +1210,7 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
           userId: "__verify__",
           agentId: "__verify__",
           topK: 1,
+          filterByScope: false, // self-test probe; bypass team scope
         });
         report.layers.inProcess.recallOk = true;
 
@@ -1178,6 +1257,7 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
           userId: "__verify__",
           agentId: "__verify__",
           topK: 5,
+          filterByScope: false, // self-test probe; bypass team scope
         });
         report.layers.injection.recallStrategy = recallResult.recallStrategy;
 
@@ -1208,6 +1288,80 @@ Memory layers: L0 (raw) → L1 (atomic) → L2 (scene) → L3 (persona)`,
       } catch (e: any) {
         report.layers.sideEffects.passed = false;
         report.layers.sideEffects.error = e?.message ?? String(e);
+        report.success = false;
+      }
+
+      // Layer 4: multi-agent isolation (team scope filter). Uses a tmp store +
+      // TeamPersistence so it does not pollute the gateway's real data dir.
+      report.layers.multiAgentIsolation = {
+        passed: false,
+        selfOnlyOk: false,
+        importedOk: false,
+        sharedNotImportedHidden: false,
+      };
+      try {
+        const { mkdtempSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const probeDir = mkdtempSync(`${tmpdir()}/memory_new_verify_multiagent-`);
+        const probeStore = new MemoryStore(probeDir);
+        const probeTp = new TeamPersistence({ dataDir: probeDir, teamId: "verify-team", maxImportedAgents: 2 });
+        const probeStorage = new StorageAdapter(probeDir);
+        const probeEngine = new RecallEngine(probeStorage);
+        await probeStorage.appendL1({
+          id: "row-self", content: "test keyword", type: "fact", priority: 50,
+          sceneName: "Verify", sourceMessageIds: [], metadata: {},
+          timestamps: [new Date().toISOString()],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(), version: 1,
+          sessionKey: "probe", sessionId: "probe", userId: "u", agentId: "main",
+        });
+        await probeStorage.appendL1({
+          id: "row-other", content: "test keyword", type: "fact", priority: 50,
+          sceneName: "Verify", sourceMessageIds: [], metadata: {},
+          timestamps: [new Date().toISOString()],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(), version: 1,
+          sessionKey: "probe", sessionId: "probe", userId: "u", agentId: "secondary",
+        });
+
+        const r1 = await probeEngine.recall({
+          query: "test keyword", sessionKey: "probe", userId: "u",
+          agentId: "main", topK: 10, importedAgentIds: [], filterByScope: true,
+        });
+        report.layers.multiAgentIsolation.selfOnlyOk =
+          (r1.recalledL1Memories ?? []).some((m: any) => m.id === "row-self") &&
+          !(r1.recalledL1Memories ?? []).some((m: any) => m.id === "row-other");
+
+        const r2 = await probeEngine.recall({
+          query: "test keyword", sessionKey: "probe", userId: "u",
+          agentId: "main", topK: 10, importedAgentIds: ["secondary"], filterByScope: true,
+        });
+        report.layers.multiAgentIsolation.importedOk =
+          (r2.recalledL1Memories ?? []).some((m: any) => m.id === "row-other");
+
+        // secondary flips shared but main never imports.
+        probeTp.setSharedToTeam("secondary", true, "secondary");
+        const r3 = await probeEngine.recall({
+          query: "test keyword", sessionKey: "probe", userId: "u",
+          agentId: "main", topK: 10, importedAgentIds: probeTp.listImportedAgentIds("main"),
+          filterByScope: true,
+        });
+        report.layers.multiAgentIsolation.sharedNotImportedHidden =
+          !(r3.recalledL1Memories ?? []).some((m: any) => m.id === "row-other");
+
+        report.layers.multiAgentIsolation.passed =
+          report.layers.multiAgentIsolation.selfOnlyOk &&
+          report.layers.multiAgentIsolation.importedOk &&
+          report.layers.multiAgentIsolation.sharedNotImportedHidden;
+
+        try {
+          const { rmSync } = await import("node:fs");
+          rmSync(probeDir, { recursive: true, force: true });
+        } catch { /* best effort cleanup */ }
+
+        if (!report.layers.multiAgentIsolation.passed) report.success = false;
+      } catch (e: any) {
+        report.layers.multiAgentIsolation.error = e?.message ?? String(e);
         report.success = false;
       }
 
@@ -1334,20 +1488,24 @@ Generated: ${new Date().toISOString()}
       if (!config.enabled) return undefined;
 
       const sessionKey = ctx.sessionKey ?? "default";
-      const userId = "user";  // Default user
+      const localAgent = resolveLocalAgentId(ctx);
+      const localUser = resolveLocalUserId(ctx);
+      const imported = teamPersistence.readRelation(localAgent).importedAgentIds;
 
       try {
         // Recall relevant memories
         const query = event.prompt?.slice(0, 200) ?? "no-prompt";
-        api.logger.info?.(`[memory_new] before_prompt_build called with query: "${query}"`);
+        api.logger.info?.(`[memory_new] before_prompt_build called with query: "${query}" (agent=${localAgent}, imports=${imported.length})`);
 
         const recallResult = await recall.recall({
           query,
           sessionKey,
-          userId,
-          agentId: "self",
+          userId: localUser,
+          agentId: localAgent,
           topK: config.retrieval.topK,
           vectorStore: config.retrieval.hybridSearch ? vectorStore : undefined,
+          importedAgentIds: imported,
+          filterByScope: config.teamMemory.filterByScope !== false,
         });
 
         api.logger.info?.(`[memory_new] recallResult: strategy=${recallResult.recallStrategy}, memories=${recallResult.recalledL1Memories?.length ?? 0}`);
@@ -1378,6 +1536,8 @@ Generated: ${new Date().toISOString()}
       if (!config.enabled || !config.layersEnabled.L0) return;
 
       const sessionKey = ctx.sessionKey ?? "default";
+      const l0Agent = resolveLocalAgentId(ctx);
+      const l0User = resolveLocalUserId(ctx);
 
       try {
         // Get messages from event (if available)
@@ -1392,8 +1552,8 @@ Generated: ${new Date().toISOString()}
               timestamp: msg.timestamp ?? Date.now(),
               sessionKey,
               sessionId: sessionKey,
-              userId: "user",
-              agentId: "self",
+              userId: l0User,
+              agentId: l0Agent,
             };
 
             await store.ingestMessage(l0Msg);
@@ -1486,12 +1646,17 @@ Generated: ${new Date().toISOString()}
         required: ["query"],
       },
       execute: async (params, ctx) => {
+        const toolAgent = resolveLocalAgentId(ctx);
+        const toolUser = resolveLocalUserId(ctx);
+        const imported = teamPersistence.readRelation(toolAgent).importedAgentIds;
         const result = await recall.recall({
           query: params.query,
           sessionKey: ctx.sessionKey ?? "default",
-          userId: "user",
-          agentId: "self",
+          userId: toolUser,
+          agentId: toolAgent,
           topK: params.limit ?? 10,
+          importedAgentIds: imported,
+          filterByScope: config.teamMemory.filterByScope !== false,
         });
 
         reinforceRecalled(result);
@@ -1549,8 +1714,8 @@ Generated: ${new Date().toISOString()}
           timestamps: [new Date().toISOString()],
           sessionKey: ctx.sessionKey ?? "default",
           sessionId: ctx.sessionKey ?? "default",
-          userId: "user",
-          agentId: "self",
+          userId: resolveLocalUserId(ctx),
+          agentId: resolveLocalAgentId(ctx),
         });
 
         return { engramId: record.id, stored: true };
@@ -1622,109 +1787,12 @@ Generated: ${new Date().toISOString()}
     });
 
     // =========================================================================
-    // HTTP Routes (team memory sync - reserved interface)
+    // HTTP routes for team memory were removed. The OpenClaw SDK
+    // (registerHttpRoute) requires `auth: "gateway" | "plugin"` and a raw node
+    // http handler signature; the prior `auth: "none"` blocks were never
+    // registered (gateway log: "missing or invalid auth"). Team status now
+    // surfaces via the standalone visualize server at /api/team-status.
     // =========================================================================
-
-    api.registerHttpRoute({
-      method: "GET",
-      path: "/memory/team/status",
-      auth: "none",
-      handler: async (req, ctx) => {
-        if (!config.teamMemory.enabled) {
-          return { status: 403, body: { error: "Team memory disabled" } };
-        }
-
-        const stats = await pipeline.getStats();
-        const sharedCount = teamMemory.getSharedEngrams("self").length;
-        const importedCount = teamMemory.getImportedEngrams("self").length;
-
-        return {
-          status: 200,
-          body: {
-            enabled: true,
-            maxImportedAgents: config.teamMemory.maxImportedAgents,
-            l1Count: stats.l1Count,
-            l2Count: stats.l2Count,
-            sharedCount,
-            importedCount,
-            visibilityGate: config.teamMemory.visibilityGate,
-          },
-        };
-      },
-    });
-
-    api.registerHttpRoute({
-      method: "POST",
-      path: "/memory/team/share",
-      auth: "none",
-      handler: async (req, ctx) => {
-        if (!config.teamMemory.enabled) {
-          return { status: 403, body: { error: "Team memory disabled" } };
-        }
-
-        const body = (req as any).body || {};
-        const { engramId, visibility = "team" } = body;
-
-        if (!engramId) {
-          return { status: 400, body: { error: "engramId required" } };
-        }
-
-        // Create a minimal engram for sharing
-        const engram: Engram = {
-          id: engramId,
-          kind: "fact",
-          status: "active",
-          visibility: visibility as any,
-          verification: "probable",
-          content: "",
-          importance: 0.5,
-          lastEffectiveAt: Date.now(),
-          metadata: { shared: true },
-          tags: [],
-          contextTags: [],
-          source: "team-share",
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          createdBy: "self",
-          trustLevel: "direct",
-          synapses: [],
-        };
-
-        const result = teamMemory.share(engram, "self");
-
-        if (!result.success) {
-          return { status: 400, body: { error: result.error } };
-        }
-
-        return { status: 200, body: { success: true, engramId } };
-      },
-    });
-
-    api.registerHttpRoute({
-      method: "POST",
-      path: "/memory/team/import",
-      auth: "none",
-      handler: async (req, ctx) => {
-        if (!config.teamMemory.enabled) {
-          return { status: 403, body: { error: "Team memory disabled" } };
-        }
-
-        const body = (req as any).body || {};
-        const { fromAgentId, engramIds } = body;
-
-        if (!fromAgentId || !engramIds || !Array.isArray(engramIds)) {
-          return { status: 400, body: { error: "fromAgentId and engramIds[] required" } };
-        }
-
-        const result = teamMemory.import(fromAgentId, "self", engramIds);
-
-        if (!result.success) {
-          return { status: 400, body: { error: result.error } };
-        }
-
-        return { status: 200, body: { success: true, imported: result.imported } };
-      },
-    });
 
     // Arm the periodic decay timer once everything is wired up. The runtime
     // lifecycle cleanup (registered above) stops it on unload.
@@ -1766,7 +1834,7 @@ Generated: ${new Date().toISOString()}
                 stateMachine: { enabled: true },
                 intervalHours: 6,
               },
-              teamMemory: { enabled: true, maxImportedAgents: 2, visibilityGate: true },
+              teamMemory: { enabled: true, maxImportedAgents: 2, visibilityGate: true, filterByScope: true, teamId: "default-team" },
             },
             plugins: {
               entries: {
@@ -1836,4 +1904,8 @@ export const testing = {
   // Team memory
   validateVisibilityTransition,
   TeamEventStore,
+  TeamPersistence,
+  resolveLocalAgentId,
+  resolveLocalUserId,
+  sanitizeAgentId,
 };

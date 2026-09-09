@@ -84,7 +84,9 @@
         "properties": {
           "enabled": { "type": "boolean" },
           "maxImportedAgents": { "type": "number" },
-          "visibilityGate": { "type": "boolean" }
+          "visibilityGate": { "type": "boolean" },
+          "filterByScope": { "type": "boolean", "default": true },
+          "teamId": { "type": "string" }
         }
       },
 
